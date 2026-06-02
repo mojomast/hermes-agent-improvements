@@ -1,0 +1,9 @@
+0001-feat-add-trace-episodes-and-semantic-coding-primitiv.patch
+0002-fix-harden-self-improvement-privacy-redaction.patch
+0003-feat-add-training-episode-replay-eval.patch
+0004-feat-add-episode-retrieval-behavioral-hints.patch
+0005-routing-add-deterministic-task-router-evaluation-har.patch
+0006-delegate-centralize-child-toolset-scoping.patch
+0007-context-default-skills-prompt-to-lazy-loading.patch
+0008-web-add-local-duckduckgo-search-fallback.patch
+0009-telemetry-record-prompt-budget-token-buckets.patch

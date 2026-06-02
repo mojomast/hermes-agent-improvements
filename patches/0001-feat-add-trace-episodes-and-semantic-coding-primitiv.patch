@@ -1,0 +1,1320 @@
+From e56de502c144050dbd36e4b1def7886290d3eaf1 Mon Sep 17 00:00:00 2001
+From: mojomast <mojomast@users.noreply.github.com>
+Date: Tue, 2 Jun 2026 13:29:36 -0400
+Subject: [PATCH 1/9] feat: add trace episodes and semantic coding primitives
+
+---
+ .gitignore                                    |  61 +++-
+ agent/semantic_code_index.py                  | 328 ++++++++++++++++++
+ agent/training_episodes.py                    | 291 ++++++++++++++++
+ hermes_cli/web_server.py                      |  32 ++
+ pyproject.toml                                |   6 +-
+ .../evaluate_self_improvement_capabilities.py | 110 ++++++
+ tests/agent/test_semantic_code_index.py       |  90 +++++
+ tests/agent/test_training_episodes.py         | 117 +++++++
+ tests/tools/test_self_improvement_tool.py     |  25 ++
+ tools/self_improvement_tool.py                | 117 +++++++
+ toolsets.py                                   |  14 +
+ 11 files changed, 1189 insertions(+), 2 deletions(-)
+ create mode 100644 agent/semantic_code_index.py
+ create mode 100644 agent/training_episodes.py
+ create mode 100755 scripts/evaluate_self_improvement_capabilities.py
+ create mode 100644 tests/agent/test_semantic_code_index.py
+ create mode 100644 tests/agent/test_training_episodes.py
+ create mode 100644 tests/tools/test_self_improvement_tool.py
+ create mode 100644 tools/self_improvement_tool.py
+
+diff --git a/.gitignore b/.gitignore
+index 72f3bd17f..a12d9ce0a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -12,7 +12,7 @@ __pycache__/
+ .env.production.local
+ .env.development
+ .env.test
+-export*
++/exports/
+ __pycache__/model_tools.cpython-310.pyc
+ __pycache__/web_tools.cpython-310.pyc
+ logs/
+@@ -52,6 +52,65 @@ ignored/
+ .worktrees/
+ environments/benchmarks/evals/
+ 
++# Generated artifact directories. Keep artifact extensions scoped here so
++# fixtures and source-controlled examples elsewhere are not hidden.
++/.hermes-episodes/
++/code_index_cache/
++/self-improvement-evals/
++/exports/**/*.jsonl
++/exports/**/*.db
++/exports/**/*.sqlite
++/exports/**/*.sqlite3
++/exports/**/*.npy
++/exports/**/*.pt
++/exports/**/*.pth
++/exports/**/*.safetensors
++/exports/**/*.onnx
++/exports/**/*.parquet
++/exports/**/*.feather
++/exports/**/*.arrow
++/exports/**/*.log
++/.hermes-episodes/**/*.jsonl
++/.hermes-episodes/**/*.db
++/.hermes-episodes/**/*.sqlite
++/.hermes-episodes/**/*.sqlite3
++/.hermes-episodes/**/*.npy
++/.hermes-episodes/**/*.pt
++/.hermes-episodes/**/*.pth
++/.hermes-episodes/**/*.safetensors
++/.hermes-episodes/**/*.onnx
++/.hermes-episodes/**/*.parquet
++/.hermes-episodes/**/*.feather
++/.hermes-episodes/**/*.arrow
++/.hermes-episodes/**/*.log
++/code_index_cache/**/*.jsonl
++/code_index_cache/**/*.db
++/code_index_cache/**/*.sqlite
++/code_index_cache/**/*.sqlite3
++/code_index_cache/**/*.npy
++/code_index_cache/**/*.pt
++/code_index_cache/**/*.pth
++/code_index_cache/**/*.safetensors
++/code_index_cache/**/*.onnx
++/code_index_cache/**/*.parquet
++/code_index_cache/**/*.feather
++/code_index_cache/**/*.arrow
++/code_index_cache/**/*.log
++/self-improvement-evals/**/*.json
++/self-improvement-evals/**/*.jsonl
++/self-improvement-evals/**/*.db
++/self-improvement-evals/**/*.sqlite
++/self-improvement-evals/**/*.sqlite3
++/self-improvement-evals/**/*.npy
++/self-improvement-evals/**/*.pt
++/self-improvement-evals/**/*.pth
++/self-improvement-evals/**/*.safetensors
++/self-improvement-evals/**/*.onnx
++/self-improvement-evals/**/*.parquet
++/self-improvement-evals/**/*.feather
++/self-improvement-evals/**/*.arrow
++/self-improvement-evals/**/*.log
++
+ # Web UI build output
+ hermes_cli/web_dist/
+ 
+diff --git a/agent/semantic_code_index.py b/agent/semantic_code_index.py
+new file mode 100644
+index 000000000..bf3912412
+--- /dev/null
++++ b/agent/semantic_code_index.py
+@@ -0,0 +1,328 @@
++"""Project-local semantic code index for IDE-grade Hermes coding mode.
++
++Bounded contexts:
++- Semantic Code Index: cached model of symbols, definitions, references,
++  diagnostics, and language/file metadata.
++- Coding Primitive: tool-facing operation over the semantic index.
++
++First version uses Python AST and lightweight JS/TS structure extraction. It is
++not a grep wrapper: symbol definitions and Python references come from syntax
++nodes; diagnostics use parsers/compilers where available.
++"""
++from __future__ import annotations
++
++import ast
++import hashlib
++import json
++import os
++import re
++import subprocess
++import time
++from dataclasses import asdict, dataclass
++from pathlib import Path
++from typing import Any, Dict, Iterable, List, Optional
++
++from hermes_constants import get_hermes_home
++
++CACHE_VERSION = "semantic_code_index.v2"
++SUPPORTED_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx"}
++SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "__pycache__", "dist", "build", ".mypy_cache", ".pytest_cache"}
++JS_DEF_RE = re.compile(r"(?:export\s+)?(?:(?:async\s+)?(?P<decl_kind>function|class)\s+(?P<decl_name>[A-Za-z_$][\w$]*)|(?P<var_kind>const|let|var)\s+(?P<var_name>[A-Za-z_$][\w$]*)\s*=|interface\s+(?P<interface_name>[A-Za-z_$][\w$]*)|type\s+(?P<type_name>[A-Za-z_$][\w$]*)\s*=)")
++IDENT_RE = re.compile(r"\b[A-Za-z_$][\w$]*\b")
++
++
++@dataclass(frozen=True)
++class CodeSymbol:
++    name: str
++    kind: str
++    language: str
++    path: str
++    line: int
++    column: int
++    end_line: Optional[int] = None
++    parent: Optional[str] = None
++
++
++@dataclass(frozen=True)
++class CodeReference:
++    name: str
++    path: str
++    line: int
++    column: int
++    context: str
++    language: str
++
++
++@dataclass(frozen=True)
++class CodeDiagnostic:
++    path: str
++    line: int
++    column: int
++    severity: str
++    message: str
++    source: str
++
++
++@dataclass
++class SemanticCodeIndex:
++    root: str
++    version: str
++    built_at: float
++    file_count: int
++    languages: Dict[str, int]
++    fingerprint: str
++    symbols: List[CodeSymbol]
++    references: List[CodeReference]
++    diagnostics: List[CodeDiagnostic]
++    index_latency_ms: int
++
++    def to_dict(self) -> Dict[str, Any]:
++        return asdict(self)
++
++
++def language_for(path: Path) -> str:
++    if path.suffix == ".py":
++        return "python"
++    if path.suffix in {".ts", ".tsx"}:
++        return "typescript"
++    if path.suffix in {".js", ".jsx"}:
++        return "javascript"
++    return "unknown"
++
++
++def iter_source_files(root: Path, max_files: int = 2_000) -> Iterable[Path]:
++    count = 0
++    for current, dirs, files in os.walk(root):
++        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
++        for name in files:
++            path = Path(current) / name
++            if path.suffix in SUPPORTED_SUFFIXES:
++                yield path
++                count += 1
++                if count >= max_files:
++                    return
++
++
++def project_fingerprint(files: List[Path], root: Path) -> str:
++    h = hashlib.sha256()
++    for p in files:
++        try:
++            st = p.stat()
++            h.update(str(p.relative_to(root)).encode())
++            h.update(str(int(st.st_mtime_ns)).encode())
++            h.update(str(st.st_size).encode())
++        except OSError:
++            continue
++    return h.hexdigest()
++
++
++def _line_context(lines: List[str], line: int) -> str:
++    if 1 <= line <= len(lines):
++        return lines[line - 1].strip()[:240]
++    return ""
++
++
++class _PythonVisitor(ast.NodeVisitor):
++    def __init__(self, rel_path: str, lines: List[str], include_context: bool = False):
++        self.rel_path = rel_path
++        self.lines = lines
++        self.include_context = include_context
++        self.symbols: List[CodeSymbol] = []
++        self.refs: List[CodeReference] = []
++        self.stack: List[str] = []
++
++    def _context_for(self, line: int) -> str:
++        return _line_context(self.lines, line) if self.include_context else ""
++
++    def _add_symbol(self, node: ast.AST, name: str, kind: str) -> None:
++        line = getattr(node, "lineno", 1)
++        col = getattr(node, "col_offset", 0)
++        self.symbols.append(CodeSymbol(name=name, kind=kind, language="python", path=self.rel_path, line=line, column=col, end_line=getattr(node, "end_lineno", None), parent=(self.stack[-1] if self.stack else None)))
++        # Treat definitions as semantic references too, matching LSP-style
++        # reference lists that can include declaration/definition sites.
++        self.refs.append(CodeReference(name=name, path=self.rel_path, line=line, column=col, context=self._context_for(line), language="python"))
++
++    def visit_ClassDef(self, node: ast.ClassDef) -> Any:
++        self._add_symbol(node, node.name, "class")
++        self.stack.append(node.name)
++        self.generic_visit(node)
++        self.stack.pop()
++
++    def visit_FunctionDef(self, node: ast.FunctionDef) -> Any:
++        self._add_symbol(node, node.name, "function")
++        self.stack.append(node.name)
++        self.generic_visit(node)
++        self.stack.pop()
++
++    visit_AsyncFunctionDef = visit_FunctionDef
++
++    def visit_Assign(self, node: ast.Assign) -> Any:
++        for target in node.targets:
++            if isinstance(target, ast.Name):
++                self._add_symbol(target, target.id, "variable")
++        self.generic_visit(node)
++
++    def visit_Name(self, node: ast.Name) -> Any:
++        self.refs.append(CodeReference(name=node.id, path=self.rel_path, line=node.lineno, column=node.col_offset, context=self._context_for(node.lineno), language="python"))
++
++
++def parse_python(path: Path, root: Path, include_context: bool = False) -> tuple[List[CodeSymbol], List[CodeReference], List[CodeDiagnostic]]:
++    rel = str(path.relative_to(root))
++    text = path.read_text(encoding="utf-8", errors="replace")
++    lines = text.splitlines()
++    try:
++        tree = ast.parse(text, filename=rel)
++    except SyntaxError as exc:
++        return [], [], [CodeDiagnostic(path=rel, line=exc.lineno or 1, column=exc.offset or 0, severity="error", message=exc.msg, source="python.ast")]
++    visitor = _PythonVisitor(rel, lines, include_context=include_context)
++    visitor.visit(tree)
++    return visitor.symbols, visitor.refs, []
++
++
++def _js_var_decl_kind(line: str, match: re.Match[str]) -> str:
++    initializer = line[match.end():].lstrip()
++    if initializer.startswith("async "):
++        initializer = initializer[6:].lstrip()
++    if initializer.startswith("function") or "=>" in initializer:
++        return "function"
++    return "variable"
++
++
++def parse_js_like(path: Path, root: Path, include_context: bool = False) -> tuple[List[CodeSymbol], List[CodeReference], List[CodeDiagnostic]]:
++    rel = str(path.relative_to(root))
++    text = path.read_text(encoding="utf-8", errors="replace")
++    lang = language_for(path)
++    symbols: List[CodeSymbol] = []
++    refs: List[CodeReference] = []
++    lines = text.splitlines()
++    for line_no, line in enumerate(lines, start=1):
++        for match in JS_DEF_RE.finditer(line):
++            if match.group("decl_name"):
++                name = match.group("decl_name")
++                kind = match.group("decl_kind") or "function"
++            elif match.group("interface_name"):
++                name = match.group("interface_name")
++                kind = "interface"
++            elif match.group("type_name"):
++                name = match.group("type_name")
++                kind = "type"
++            elif match.group("var_name"):
++                name = match.group("var_name")
++                kind = _js_var_decl_kind(line, match)
++            else:
++                continue
++            symbols.append(CodeSymbol(name=name, kind=kind, language=lang, path=rel, line=line_no, column=match.start(), end_line=line_no))
++        for match in IDENT_RE.finditer(line):
++            refs.append(CodeReference(name=match.group(0), path=rel, line=line_no, column=match.start(), context=(line.strip()[:240] if include_context else ""), language=lang))
++    diagnostics: List[CodeDiagnostic] = []
++    if path.suffix == ".js":
++        try:
++            proc = subprocess.run(["node", "--check", str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
++            if proc.returncode != 0:
++                diagnostics.append(CodeDiagnostic(path=rel, line=1, column=0, severity="error", message=(proc.stderr or proc.stdout).strip()[:500], source="node --check"))
++        except (FileNotFoundError, subprocess.TimeoutExpired):
++            pass
++    return symbols, refs, diagnostics
++
++
++def build_index(project_path: str | Path, max_files: int = 2_000, include_context: bool = False) -> SemanticCodeIndex:
++    root = Path(project_path).expanduser().resolve()
++    start = time.perf_counter()
++    files = list(iter_source_files(root, max_files=max_files))
++    fingerprint = project_fingerprint(files, root)
++    languages: Dict[str, int] = {}
++    symbols: List[CodeSymbol] = []
++    refs: List[CodeReference] = []
++    diagnostics: List[CodeDiagnostic] = []
++    for path in files:
++        lang = language_for(path)
++        languages[lang] = languages.get(lang, 0) + 1
++        try:
++            if path.suffix == ".py":
++                s, r, d = parse_python(path, root, include_context=include_context)
++            else:
++                s, r, d = parse_js_like(path, root, include_context=include_context)
++            symbols.extend(s); refs.extend(r); diagnostics.extend(d)
++        except OSError as exc:
++            diagnostics.append(CodeDiagnostic(path=str(path), line=1, column=0, severity="error", message=str(exc), source="indexer"))
++    latency = int((time.perf_counter() - start) * 1000)
++    return SemanticCodeIndex(str(root), CACHE_VERSION, time.time(), len(files), languages, fingerprint, symbols, refs, diagnostics, latency)
++
++
++def cache_path_for(project_path: str | Path) -> Path:
++    root = Path(project_path).expanduser().resolve()
++    digest = hashlib.sha256(str(root).encode()).hexdigest()[:16]
++    return get_hermes_home() / "code_index_cache" / f"{digest}.json"
++
++
++def load_or_build_index(project_path: str | Path, use_cache: bool = True, include_context: bool = False) -> SemanticCodeIndex:
++    root = Path(project_path).expanduser().resolve()
++    files = list(iter_source_files(root))
++    fp = project_fingerprint(files, root)
++    cp = cache_path_for(root)
++    # Raw code contexts are intentionally never read from or written to the durable
++    # cache. Opt-in context lookups rebuild in memory for this request only while
++    # also replacing any legacy/raw cache file with a context-free v2 cache.
++    if include_context:
++        if use_cache:
++            try:
++                safe_idx = build_index(root, include_context=False)
++                cp.parent.mkdir(parents=True, exist_ok=True)
++                cp.write_text(json.dumps(safe_idx.to_dict(), sort_keys=True), encoding="utf-8")
++            except Exception:
++                pass
++        return build_index(root, include_context=True)
++    if use_cache and cp.exists():
++        try:
++            data = json.loads(cp.read_text(encoding="utf-8"))
++            if data.get("fingerprint") == fp and data.get("version") == CACHE_VERSION:
++                return SemanticCodeIndex(
++                    root=data["root"], version=data["version"], built_at=data["built_at"], file_count=data["file_count"], languages=data["languages"], fingerprint=data["fingerprint"],
++                    symbols=[CodeSymbol(**s) for s in data.get("symbols", [])], references=[CodeReference(**{**r, "context": ""}) for r in data.get("references", [])], diagnostics=[CodeDiagnostic(**d) for d in data.get("diagnostics", [])], index_latency_ms=0,
++                )
++        except Exception:
++            pass
++    idx = build_index(root, include_context=False)
++    if use_cache:
++        cp.parent.mkdir(parents=True, exist_ok=True)
++        cp.write_text(json.dumps(idx.to_dict(), sort_keys=True), encoding="utf-8")
++    return idx
++
++
++def find_symbols(project_path: str | Path, query: str = "", kind: str | None = None, limit: int = 50) -> Dict[str, Any]:
++    idx = load_or_build_index(project_path)
++    q = (query or "").lower()
++    hits = [s for s in idx.symbols if (not q or q in s.name.lower()) and (not kind or s.kind == kind)]
++    return {"index": {"root": idx.root, "files": idx.file_count, "languages": idx.languages, "latency_ms": idx.index_latency_ms}, "symbols": [asdict(s) for s in hits[:limit]], "total": len(hits)}
++
++
++def go_to_definition(project_path: str | Path, name: str) -> Dict[str, Any]:
++    idx = load_or_build_index(project_path)
++    hits = [s for s in idx.symbols if s.name == name]
++    return {"definitions": [asdict(s) for s in hits], "total": len(hits)}
++
++
++def list_references(project_path: str | Path, name: str, limit: int = 100, include_context: bool = False) -> Dict[str, Any]:
++    idx = load_or_build_index(project_path, include_context=include_context)
++    hits = [r for r in idx.references if r.name == name]
++    return {"references": [asdict(r) for r in hits[:limit]], "total": len(hits)}
++
++
++def get_diagnostics(project_path: str | Path, limit: int = 100) -> Dict[str, Any]:
++    idx = load_or_build_index(project_path, use_cache=False)
++    return {"diagnostics": [asdict(d) for d in idx.diagnostics[:limit]], "total": len(idx.diagnostics), "index": {"files": idx.file_count, "languages": idx.languages, "latency_ms": idx.index_latency_ms}}
++
++
++def semantic_lookup(project_path: str | Path, operation: str, query: str = "", kind: str | None = None, limit: int = 50, include_context: bool = False) -> Dict[str, Any]:
++    if operation in {"index", "summary"}:
++        idx = load_or_build_index(project_path)
++        return {"root": idx.root, "file_count": idx.file_count, "languages": idx.languages, "symbol_count": len(idx.symbols), "reference_count": len(idx.references), "diagnostic_count": len(idx.diagnostics), "index_latency_ms": idx.index_latency_ms, "fingerprint": idx.fingerprint[:16]}
++    if operation == "find_symbol":
++        return find_symbols(project_path, query=query, kind=kind, limit=limit)
++    if operation == "definition":
++        return go_to_definition(project_path, query)
++    if operation == "references":
++        return list_references(project_path, query, limit=limit, include_context=include_context)
++    if operation == "diagnostics":
++        return get_diagnostics(project_path, limit=limit)
++    raise ValueError(f"unsupported semantic operation: {operation}")
+diff --git a/agent/training_episodes.py b/agent/training_episodes.py
+new file mode 100644
+index 000000000..593cfedac
+--- /dev/null
++++ b/agent/training_episodes.py
+@@ -0,0 +1,291 @@
++"""Trace-to-episode projections for Hermes self-improvement.
++
++Bounded contexts:
++- Execution Trace: append-only operational trace rows + spans from SessionDB.
++- Training Episode: privacy-minimized, replay/eval projection of one trace.
++- Outcome Signal: measurable evidence extracted from structural trace metadata.
++
++This module intentionally does not store raw prompts, tool args/results, env vars,
++headers, or model payloads. It consumes the existing structural traces/spans.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++import sqlite3
++import time
++from dataclasses import asdict, dataclass, field
++from pathlib import Path
++from typing import Any, Dict, Iterable, List, Optional
++
++from hermes_constants import get_hermes_home
++from hermes_state import DEFAULT_DB_PATH
++
++SCHEMA_VERSION = "training_episode.v1"
++MAX_METADATA_CHARS = 2_000
++SECRET_RE = re.compile(r"(?i)(api[_-]?key|token|secret|password|authorization|bearer|sk-[a-z0-9])")
++RAW_CONTENT_KEYS = {
++    "result",
++    "output",
++    "prompt",
++    "message",
++    "content",
++    "stdout",
++    "stderr",
++    "body",
++    "payload",
++    "headers",
++    "args",
++    "arguments",
++    "command",
++    "input",
++    "env",
++}
++RAW_PAYLOAD_REDACTION = "[REDACTED_RAW_PAYLOAD]"
++GENERATED_ARTIFACT_PATTERNS = (
++    ".jsonl", ".db", ".sqlite", ".sqlite3", ".npy", ".pt", ".pth",
++    ".safetensors", ".onnx", ".parquet", ".feather", ".arrow", ".log",
++)
++
++
++@dataclass(frozen=True)
++class EpisodeStep:
++    step_index: int
++    span_type: str
++    name: str
++    status: str
++    duration_ms: Optional[int]
++    error_class: Optional[str] = None
++    metadata: Dict[str, Any] = field(default_factory=dict)
++
++
++@dataclass(frozen=True)
++class OutcomeSignal:
++    name: str
++    value: float | int | bool | str
++    weight: float = 1.0
++    source: str = "trace"
++
++
++@dataclass(frozen=True)
++class TrainingEpisode:
++    schema_version: str
++    episode_id: str
++    trace_id: str
++    session_id: Optional[str]
++    turn_id: Optional[str]
++    user_message_hash: Optional[str]
++    started_at: float
++    ended_at: Optional[float]
++    elapsed_ms: Optional[int]
++    trace_status: str
++    steps: List[EpisodeStep]
++    outcome_signals: List[OutcomeSignal]
++    reward: float
++    ready_for_training: bool
++    privacy: Dict[str, Any]
++
++    def to_dict(self) -> Dict[str, Any]:
++        return asdict(self)
++
++
++def _connect_readonly(db_path: Path) -> sqlite3.Connection:
++    if not db_path.exists():
++        raise FileNotFoundError(f"state DB not found: {db_path}")
++    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
++    con.row_factory = sqlite3.Row
++    return con
++
++
++def _safe_json(value: str | None) -> Dict[str, Any]:
++    if not value:
++        return {}
++    if len(value) > MAX_METADATA_CHARS:
++        return {"truncated": True, "length": len(value)}
++    try:
++        data = json.loads(value)
++    except Exception:
++        return {}
++    if not isinstance(data, dict):
++        return {}
++    return minimize_payload(data)
++
++
++def _raw_payload_digest(value: Any) -> Dict[str, Any]:
++    """Describe a raw payload without exporting any of its contents."""
++    try:
++        encoded = json.dumps(value, sort_keys=True, default=str).encode("utf-8", "replace")
++    except Exception:
++        encoded = str(type(value).__name__).encode("utf-8", "replace")
++    return {
++        "redacted": RAW_PAYLOAD_REDACTION,
++        "length": len(encoded),
++        "sha256_prefix": hashlib.sha256(encoded).hexdigest()[:16],
++    }
++
++
++def minimize_payload(data: Dict[str, Any]) -> Dict[str, Any]:
++    """Return JSON-safe metadata with secrets and raw-content payloads stripped."""
++    safe: Dict[str, Any] = {}
++    for key, value in list(data.items())[:40]:
++        k = str(key)
++        normalized_key = k.lower()
++        if normalized_key in RAW_CONTENT_KEYS:
++            safe[k] = _raw_payload_digest(value)
++            continue
++        if SECRET_RE.search(k):
++            safe[k] = "[REDACTED]"
++            continue
++        if isinstance(value, (bool, int, float)) or value is None:
++            safe[k] = value
++        elif isinstance(value, str):
++            if SECRET_RE.search(value):
++                safe[k] = "[REDACTED]"
++            elif len(value) > 160:
++                safe[k] = {"truncated": True, "length": len(value), "sha256_prefix": hashlib.sha256(value.encode('utf-8', 'replace')).hexdigest()[:16]}
++            else:
++                safe[k] = value
++        elif isinstance(value, (list, tuple)):
++            safe[k] = [str(v)[:80] for v in value[:10]]
++        elif isinstance(value, dict):
++            safe[k] = minimize_payload({str(a): b for a, b in list(value.items())[:10]})
++        else:
++            safe[k] = str(value)[:120]
++    return safe
++
++
++def span_duration_ms(row: sqlite3.Row) -> Optional[int]:
++    if row["start_time"] is None or row["end_time"] is None:
++        return None
++    return max(0, int((float(row["end_time"]) - float(row["start_time"])) * 1000))
++
++
++def outcome_signals_for(trace: sqlite3.Row, span_rows: Iterable[sqlite3.Row]) -> List[OutcomeSignal]:
++    spans = list(span_rows)
++    errors = [s for s in spans if str(s["status"] or "").lower() in {"error", "failed"} or s["error_class"]]
++    tool_spans = [s for s in spans if s["span_type"] in {"tool_call", "subagent"}]
++    final = next((s for s in spans if s["span_type"] == "final_answer"), None)
++    final_meta = _safe_json(final["metadata_json"] if final else None)
++    completed = bool(final_meta.get("completed")) if final_meta else str(trace["status"] or "") == "completed"
++    interrupted = bool(final_meta.get("interrupted")) if final_meta else False
++    model_calls = int(trace["total_model_calls"] or 0)
++    retry_pressure = max(0, model_calls - 1)
++    signals: List[OutcomeSignal] = [
++        OutcomeSignal("trace_completed", completed and not interrupted, 3.0),
++        OutcomeSignal("trace_error_count", len(errors), -1.5),
++        OutcomeSignal("tool_call_count", len(tool_spans), -0.03),
++        OutcomeSignal("model_retry_pressure", retry_pressure, -0.2),
++        OutcomeSignal("elapsed_ms", int(trace["total_wall_ms"] or 0), -0.00001),
++        OutcomeSignal("has_final_answer", final is not None, 1.0),
++    ]
++    if interrupted:
++        signals.append(OutcomeSignal("interrupted", True, -2.0))
++    if any(s["name"] in {"terminal", "execute_code"} and s["status"] == "completed" for s in spans):
++        signals.append(OutcomeSignal("verification_attempted", True, 0.5))
++    return signals
++
++
++def reward_from_signals(signals: Iterable[OutcomeSignal]) -> float:
++    score = 0.0
++    for sig in signals:
++        value = sig.value
++        if isinstance(value, bool):
++            numeric = 1.0 if value else 0.0
++        elif isinstance(value, (int, float)):
++            numeric = float(value)
++        else:
++            numeric = 1.0 if value else 0.0
++        score += numeric * sig.weight
++    return round(score, 4)
++
++
++def trace_to_episode(trace: sqlite3.Row | Dict[str, Any], spans: Iterable[sqlite3.Row | Dict[str, Any]]) -> TrainingEpisode:
++    # sqlite rows and dicts both support [] lookup; normalize missing via helper.
++    trace_d = dict(trace)
++    span_ds = [dict(s) for s in spans]
++    steps = [
++        EpisodeStep(
++            step_index=i,
++            span_type=str(row.get("span_type") or "unknown"),
++            name=str(row.get("name") or "unknown"),
++            status=str(row.get("status") or "unknown"),
++            duration_ms=(None if row.get("start_time") is None or row.get("end_time") is None else max(0, int((float(row["end_time"]) - float(row["start_time"])) * 1000))),
++            error_class=row.get("error_class"),
++            metadata=_safe_json(row.get("metadata_json")),
++        )
++        for i, row in enumerate(span_ds)
++    ]
++    signals = outcome_signals_for(trace_d, span_ds)
++    reward = reward_from_signals(signals)
++    ready = bool(trace_d.get("status") == "completed" and any(s.name == "trace_completed" and bool(s.value) for s in signals))
++    return TrainingEpisode(
++        schema_version=SCHEMA_VERSION,
++        episode_id=f"episode:{trace_d.get('trace_id')}",
++        trace_id=str(trace_d.get("trace_id")),
++        session_id=trace_d.get("session_id"),
++        turn_id=trace_d.get("turn_id"),
++        user_message_hash=trace_d.get("user_message_hash"),
++        started_at=float(trace_d.get("start_time") or 0.0),
++        ended_at=trace_d.get("end_time"),
++        elapsed_ms=trace_d.get("total_wall_ms"),
++        trace_status=str(trace_d.get("status") or "unknown"),
++        steps=steps,
++        outcome_signals=signals,
++        reward=reward,
++        ready_for_training=ready,
++        privacy={
++            "raw_content_exported": False,
++            "secret_redaction": "metadata keys/values matching token/key/password patterns redacted",
++            "raw_payload_redaction": "metadata under denylisted raw-content keys is replaced with length/hash descriptors",
++            "raw_content_keys": sorted(RAW_CONTENT_KEYS),
++            "generated_artifact_patterns": list(GENERATED_ARTIFACT_PATTERNS),
++        },
++    )
++
++
++def iter_episodes(db_path: Path = DEFAULT_DB_PATH, limit: int = 100, min_reward: float | None = None, ready_only: bool = False) -> Iterable[TrainingEpisode]:
++    with _connect_readonly(Path(db_path)) as con:
++        traces = con.execute("SELECT * FROM traces ORDER BY start_time DESC LIMIT ?", (int(limit),)).fetchall()
++        for trace in traces:
++            spans = con.execute("SELECT * FROM spans WHERE trace_id = ? ORDER BY start_time ASC", (trace["trace_id"],)).fetchall()
++            episode = trace_to_episode(trace, spans)
++            if min_reward is not None and episode.reward < min_reward:
++                continue
++            if ready_only and not episode.ready_for_training:
++                continue
++            yield episode
++
++
++def export_episodes_jsonl(output_path: Path, db_path: Path = DEFAULT_DB_PATH, limit: int = 100, ready_only: bool = False) -> Dict[str, Any]:
++    output_path = Path(output_path)
++    output_path.parent.mkdir(parents=True, exist_ok=True)
++    start = time.perf_counter()
++    count = 0
++    rewards: List[float] = []
++    with output_path.open("w", encoding="utf-8") as fh:
++        for episode in iter_episodes(db_path=db_path, limit=limit, ready_only=ready_only):
++            fh.write(json.dumps(episode.to_dict(), sort_keys=True) + "\n")
++            count += 1
++            rewards.append(episode.reward)
++    elapsed_ms = int((time.perf_counter() - start) * 1000)
++    return {"ok": True, "path": str(output_path), "episode_count": count, "elapsed_ms": elapsed_ms, "avg_reward": (sum(rewards) / count if count else 0.0)}
++
++
++def episode_summary(db_path: Path = DEFAULT_DB_PATH, limit: int = 100) -> Dict[str, Any]:
++    start = time.perf_counter()
++    episodes = list(iter_episodes(db_path=db_path, limit=limit))
++    elapsed_ms = int((time.perf_counter() - start) * 1000)
++    rewards = [e.reward for e in episodes]
++    return {
++        "schema_version": SCHEMA_VERSION,
++        "episode_count": len(episodes),
++        "ready_for_training_count": sum(1 for e in episodes if e.ready_for_training),
++        "recent_rewards": rewards[:10],
++        "avg_reward": (sum(rewards) / len(rewards) if rewards else 0.0),
++        "conversion_latency_ms": elapsed_ms,
++    }
++
++
++def default_episode_export_path() -> Path:
++    return get_hermes_home() / "exports" / "training_episodes.jsonl"
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 5990098e0..7bdbaaa3c 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -588,6 +588,38 @@ async def get_status():
+     }
+ 
+ 
++@app.get("/api/self-improvement/episodes")
++async def get_training_episode_summary(limit: int = 100):
++    """Dashboard-safe TrainingEpisode summary: counts/rewards only, no raw payloads."""
++    try:
++        from agent.training_episodes import episode_summary
++        return episode_summary(limit=max(1, min(int(limit), 1000)))
++    except FileNotFoundError:
++        return {"schema_version": "training_episode.v1", "episode_count": 0, "ready_for_training_count": 0, "recent_rewards": [], "avg_reward": 0.0, "conversion_latency_ms": 0}
++    except Exception as exc:
++        raise HTTPException(status_code=500, detail=str(exc))
++
++
++@app.post("/api/self-improvement/episodes/export")
++async def export_training_episodes(limit: int = 100, ready_only: bool = False):
++    """Export privacy-minimized TrainingEpisode JSONL under HERMES_HOME/exports."""
++    try:
++        from agent.training_episodes import default_episode_export_path, export_episodes_jsonl
++        return export_episodes_jsonl(default_episode_export_path(), limit=max(1, min(int(limit), 5000)), ready_only=bool(ready_only))
++    except Exception as exc:
++        raise HTTPException(status_code=500, detail=str(exc))
++
++
++@app.get("/api/coding/semantic-index")
++async def get_semantic_index(project_path: str, operation: str = "summary", query: str = "", kind: str = "", limit: int = 50, include_context: bool = False):
++    """Semantic coding primitive endpoint for dashboard/tool consumers."""
++    try:
++        from agent.semantic_code_index import semantic_lookup
++        return semantic_lookup(project_path=project_path, operation=operation, query=query, kind=(kind or None), limit=max(1, min(int(limit), 500)), include_context=include_context)
++    except Exception as exc:
++        raise HTTPException(status_code=500, detail=str(exc))
++
++
+ # ---------------------------------------------------------------------------
+ # Gateway + update actions (invoked from the Status page).
+ #
+diff --git a/pyproject.toml b/pyproject.toml
+index 4b7e8816a..18f9aa39e 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -88,7 +88,11 @@ google = [
+   "google-auth-httplib2>=0.2,<1",
+ ]
+ # `hermes dashboard` (localhost SPA + API).  Not in core to keep the default install lean.
+-web = ["fastapi>=0.104.0,<1", "uvicorn[standard]>=0.24.0,<1"]
++web = [
++  "fastapi>=0.104.0,<1",
++  "uvicorn[standard]>=0.24.0,<1",
++  "python-multipart>=0.0.9,<1",
++]
+ rl = [
+   "atroposlib @ git+https://github.com/NousResearch/atropos.git@c20c85256e5a45ad31edf8b7276e9c5ee1995a30",
+   "tinker @ git+https://github.com/thinking-machines-lab/tinker.git@30517b667f18a3dfb7ef33fb56cf686d5820ba2b",
+diff --git a/scripts/evaluate_self_improvement_capabilities.py b/scripts/evaluate_self_improvement_capabilities.py
+new file mode 100755
+index 000000000..669f6263a
+--- /dev/null
++++ b/scripts/evaluate_self_improvement_capabilities.py
+@@ -0,0 +1,110 @@
++#!/usr/bin/env python3
++"""Small offline eval harness for Hermes self-improvement substrates.
++
++Measures:
++- fixture execution trace -> TrainingEpisode conversion/export latency + reward
++- fixture codebase -> semantic symbols/definitions/references/diagnostics latency
++
++Writes no generated artifacts unless --output-json is supplied.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import tempfile
++import time
++from pathlib import Path
++
++from agent.semantic_code_index import get_diagnostics, go_to_definition, list_references, semantic_lookup
++from agent.tracing import TraceRecorder, hash_user_message
++from agent.training_episodes import export_episodes_jsonl, iter_episodes
++from hermes_state import SessionDB
++
++
++def make_trace(db_path: Path) -> None:
++    db = SessionDB(db_path)
++    try:
++        recorder = TraceRecorder(session_id="eval-session", turn_id="eval-turn", user_message_hash=hash_user_message("eval task"))
++        with recorder.span("turn", "root"):
++            with recorder.span("model_call", "llm_api_call"):
++                pass
++            with recorder.span("tool_call", "execute_code", {"arg_count": 1}):
++                pass
++            with recorder.span("final_answer", "turn.final_answer", {"completed": True, "response_len": 64}):
++                pass
++        recorder.finish("completed")
++        db.record_trace(recorder.to_trace_row(), recorder.to_span_rows())
++    finally:
++        db.close()
++
++
++def make_code_fixture(root: Path) -> None:
++    root.mkdir(parents=True, exist_ok=True)
++    (root / "app.py").write_text(
++        "class Greeter:\n"
++        "    def hello(self, name):\n"
++        "        return format_name(name)\n"
++        "\n"
++        "def format_name(value):\n"
++        "    return value.title()\n",
++        encoding="utf-8",
++    )
++    (root / "index.ts").write_text("export function loadUser() { return { name: 'Ada' } }\n", encoding="utf-8")
++
++
++def run_eval() -> dict:
++    with tempfile.TemporaryDirectory(prefix="hermes-self-improve-eval-") as tmp:
++        tmp_path = Path(tmp)
++        db_path = tmp_path / "state.db"
++        make_trace(db_path)
++        trace_start = time.perf_counter()
++        episodes = list(iter_episodes(db_path=db_path, limit=10))
++        export = export_episodes_jsonl(tmp_path / "episodes.jsonl", db_path=db_path)
++        trace_ms = int((time.perf_counter() - trace_start) * 1000)
++
++        code_root = tmp_path / "code"
++        make_code_fixture(code_root)
++        code_start = time.perf_counter()
++        summary = semantic_lookup(code_root, "summary")
++        defs = go_to_definition(code_root, "format_name")
++        refs = list_references(code_root, "format_name")
++        diags = get_diagnostics(code_root)
++        code_ms = int((time.perf_counter() - code_start) * 1000)
++
++        return {
++            "trace_to_rl": {
++                "episode_count": len(episodes),
++                "ready_for_training": sum(1 for e in episodes if e.ready_for_training),
++                "reward": episodes[0].reward if episodes else 0.0,
++                "jsonl_bytes": (tmp_path / "episodes.jsonl").stat().st_size,
++                "conversion_and_export_latency_ms": trace_ms,
++                "export": export,
++            },
++            "semantic_coding": {
++                "file_count": summary["file_count"],
++                "languages": summary["languages"],
++                "symbol_count": summary["symbol_count"],
++                "reference_count": summary["reference_count"],
++                "diagnostic_count": diags["total"],
++                "definition_hits": defs["total"],
++                "reference_hits": refs["total"],
++                "lookup_latency_ms": code_ms,
++            },
++        }
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--output-json", type=Path)
++    args = parser.parse_args()
++    result = run_eval()
++    text = json.dumps(result, indent=2, sort_keys=True)
++    if args.output_json:
++        args.output_json.parent.mkdir(parents=True, exist_ok=True)
++        args.output_json.write_text(text + "\n", encoding="utf-8")
++    print(text)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/agent/test_semantic_code_index.py b/tests/agent/test_semantic_code_index.py
+new file mode 100644
+index 000000000..e107bf0c4
+--- /dev/null
++++ b/tests/agent/test_semantic_code_index.py
+@@ -0,0 +1,90 @@
++import json
++
++from agent.semantic_code_index import cache_path_for, get_diagnostics, go_to_definition, list_references, semantic_lookup
++
++
++def test_python_semantic_index_symbols_definitions_references_and_diagnostics(tmp_path):
++    project = tmp_path / "proj"
++    project.mkdir()
++    (project / "app.py").write_text(
++        "class Greeter:\n"
++        "    def hello(self, name):\n"
++        "        return format_name(name)\n"
++        "\n"
++        "def format_name(value):\n"
++        "    return value.title()\n",
++        encoding="utf-8",
++    )
++    (project / "broken.py").write_text("def nope(:\n", encoding="utf-8")
++
++    summary = semantic_lookup(project, "summary")
++    assert summary["file_count"] == 2
++    assert summary["languages"]["python"] == 2
++    assert summary["symbol_count"] >= 3
++    assert summary["diagnostic_count"] == 1
++    assert summary["index_latency_ms"] >= 0
++
++    defs = go_to_definition(project, "format_name")
++    assert defs["definitions"][0]["path"] == "app.py"
++    assert defs["definitions"][0]["line"] == 5
++
++    refs = list_references(project, "format_name")
++    assert refs["total"] >= 2  # definition + call site from AST Name refs
++    assert any(r["line"] == 3 for r in refs["references"])
++    assert all(r.get("context", "") == "" for r in refs["references"])
++
++    refs_with_context = list_references(project, "format_name", include_context=True)
++    assert any("return format_name(name)" in r.get("context", "") for r in refs_with_context["references"])
++
++    diags = get_diagnostics(project)
++    assert diags["total"] == 1
++    assert diags["diagnostics"][0]["source"] == "python.ast"
++
++
++def test_javascript_typescript_symbol_extraction(tmp_path):
++    project = tmp_path / "web"
++    project.mkdir()
++    (project / "index.ts").write_text(
++        "export interface User { name: string }\n"
++        "export function loadUser(): User { return { name: 'Ada' } }\n"
++        "const helper = () => loadUser()\n"
++        "const config = { retries: 3 }\n",
++        encoding="utf-8",
++    )
++
++    symbols = semantic_lookup(project, "find_symbol", query="User")
++    names = {s["name"] for s in symbols["symbols"]}
++    assert {"User", "loadUser"} <= names
++    assert symbols["index"]["languages"]["typescript"] == 1
++
++    all_symbols = semantic_lookup(project, "find_symbol")
++    kinds = {s["name"]: s["kind"] for s in all_symbols["symbols"]}
++    assert kinds["helper"] == "function"
++    assert kinds["config"] == "variable"
++
++
++def test_reference_context_privacy_default_and_cache_safety(tmp_path):
++    project = tmp_path / "private"
++    project.mkdir()
++    secret_line = "SECRET_SNIPPET = 'do-not-cache-me'"
++    (project / "secret.py").write_text(
++        f"{secret_line}\n"
++        "def use_secret():\n"
++        "    return SECRET_SNIPPET\n",
++        encoding="utf-8",
++    )
++
++    default_refs = semantic_lookup(project, "references", query="SECRET_SNIPPET")
++    assert default_refs["total"] >= 2
++    assert all(r.get("context", "") == "" for r in default_refs["references"])
++
++    cache_path = cache_path_for(project)
++    cache_text = cache_path.read_text(encoding="utf-8")
++    cache_data = json.loads(cache_text)
++    assert cache_data["version"].endswith(".v2")
++    assert secret_line not in cache_text
++    assert all(r.get("context", "") == "" for r in cache_data.get("references", []))
++
++    opt_in_refs = semantic_lookup(project, "references", query="SECRET_SNIPPET", include_context=True)
++    assert any(secret_line in r.get("context", "") for r in opt_in_refs["references"])
++    assert secret_line not in cache_path.read_text(encoding="utf-8")
+diff --git a/tests/agent/test_training_episodes.py b/tests/agent/test_training_episodes.py
+new file mode 100644
+index 000000000..f7e372081
+--- /dev/null
++++ b/tests/agent/test_training_episodes.py
+@@ -0,0 +1,117 @@
++import json
++
++from agent.tracing import TraceRecorder, hash_user_message
++from agent.training_episodes import export_episodes_jsonl, episode_summary, iter_episodes, trace_to_episode
++from hermes_state import SessionDB
++
++
++def _record_fixture_trace(path, *, error=False):
++    db = SessionDB(path)
++    try:
++        recorder = TraceRecorder(session_id="sess", turn_id="turn", user_message_hash=hash_user_message("secret user task"))
++        with recorder.span("turn", "root"):
++            with recorder.span("model_call", "llm_api_call"):
++                pass
++            with recorder.span("tool_call", "terminal", {"api_key": "sk-test", "arg_count": 1}) as span:
++                if error:
++                    span.status = "error"
++                    span.error_class = "CommandFailed"
++            with recorder.span("final_answer", "turn.final_answer", {"completed": not error, "response_len": 42}):
++                pass
++        recorder.finish("completed" if not error else "failed")
++        db.record_trace(recorder.to_trace_row(), recorder.to_span_rows())
++        return recorder.trace_id
++    finally:
++        db.close()
++
++
++def test_trace_to_episode_extracts_reward_and_redacts_metadata(tmp_path):
++    db_path = tmp_path / "state.db"
++    trace_id = _record_fixture_trace(db_path)
++    episode = next(iter_episodes(db_path=db_path, limit=1))
++
++    assert episode.schema_version == "training_episode.v1"
++    assert episode.trace_id == trace_id
++    assert episode.ready_for_training is True
++    assert episode.reward > 0
++    assert any(s.name == "trace_completed" and s.value is True for s in episode.outcome_signals)
++    terminal_step = next(s for s in episode.steps if s.name == "terminal")
++    assert terminal_step.metadata["api_key"] == "[REDACTED]"
++    assert "secret user task" not in json.dumps(episode.to_dict())
++
++
++def test_raw_content_keys_redact_non_secret_private_text():
++    private_result = "private project note: launch codename velvet-mango"
++    private_stdout = "stdout contained internal customer migration details"
++    private_prompt = "prompt asked about a confidential family matter"
++    trace = {
++        "trace_id": "trace-raw-redaction",
++        "session_id": "sess",
++        "turn_id": "turn",
++        "user_message_hash": "hash",
++        "start_time": 1.0,
++        "end_time": 2.0,
++        "total_wall_ms": 1000,
++        "total_model_calls": 1,
++        "status": "completed",
++    }
++    spans = [
++        {
++            "span_type": "tool_call",
++            "name": "terminal",
++            "status": "completed",
++            "start_time": 1.0,
++            "end_time": 1.1,
++            "error_class": None,
++            "metadata_json": json.dumps(
++                {
++                    "result": private_result,
++                    "stdout": private_stdout,
++                    "nested": {"prompt": private_prompt},
++                }
++            ),
++        },
++        {
++            "span_type": "final_answer",
++            "name": "turn.final_answer",
++            "status": "completed",
++            "start_time": 1.1,
++            "end_time": 2.0,
++            "error_class": None,
++            "metadata_json": json.dumps({"completed": True}),
++        },
++    ]
++
++    episode_blob = json.dumps(trace_to_episode(trace, spans).to_dict())
++
++    assert "[REDACTED_RAW_PAYLOAD]" in episode_blob
++    assert private_result not in episode_blob
++    assert private_stdout not in episode_blob
++    assert private_prompt not in episode_blob
++
++
++def test_failed_tool_call_lowers_reward_and_blocks_training(tmp_path):
++    db_path = tmp_path / "state.db"
++    _record_fixture_trace(db_path, error=True)
++    episode = next(iter_episodes(db_path=db_path, limit=1))
++
++    assert episode.ready_for_training is False
++    assert any(s.name == "trace_error_count" and s.value >= 1 for s in episode.outcome_signals)
++    assert episode.reward < 1.0
++
++
++def test_export_jsonl_and_summary_report_latency(tmp_path):
++    db_path = tmp_path / "state.db"
++    _record_fixture_trace(db_path)
++    out = tmp_path / "episodes.jsonl"
++
++    export = export_episodes_jsonl(out, db_path=db_path, limit=10)
++    summary = episode_summary(db_path=db_path, limit=10)
++
++    assert export["episode_count"] == 1
++    assert export["elapsed_ms"] >= 0
++    rows = [json.loads(line) for line in out.read_text().splitlines()]
++    assert rows[0]["schema_version"] == "training_episode.v1"
++    assert summary["episode_count"] == 1
++    assert summary["ready_for_training_count"] == 1
++    assert summary["conversion_latency_ms"] >= 0
+diff --git a/tests/tools/test_self_improvement_tool.py b/tests/tools/test_self_improvement_tool.py
+new file mode 100644
+index 000000000..665331b21
+--- /dev/null
++++ b/tests/tools/test_self_improvement_tool.py
+@@ -0,0 +1,25 @@
++import json
++
++from model_tools import discover_builtin_tools
++from tools.registry import registry
++from toolsets import resolve_toolset
++
++
++def test_self_improvement_tools_register_and_resolve():
++    discover_builtin_tools()
++    assert registry.get_entry("training_episodes") is not None
++    assert registry.get_entry("semantic_code") is not None
++    assert "training_episodes" in resolve_toolset("self_improvement")
++    assert "semantic_code" in resolve_toolset("coding")
++    assert "training_episodes" in resolve_toolset("full") or "training_episodes" in resolve_toolset("all")
++
++
++def test_semantic_code_tool_smoke(tmp_path):
++    discover_builtin_tools()
++    project = tmp_path / "proj"
++    project.mkdir()
++    (project / "m.py").write_text("def f():\n    return 1\n", encoding="utf-8")
++    tool = registry.get_entry("semantic_code")
++    result = json.loads(tool.handler({"project_path": str(project), "operation": "definition", "query": "f"}))
++    assert result["success"] is True
++    assert result["data"]["definitions"][0]["line"] == 1
+diff --git a/tools/self_improvement_tool.py b/tools/self_improvement_tool.py
+new file mode 100644
+index 000000000..6ced3ad89
+--- /dev/null
++++ b/tools/self_improvement_tool.py
+@@ -0,0 +1,117 @@
++"""Hermes self-improvement tools: trace episodes and semantic coding primitives."""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from typing import Any, Dict
++
++from agent.semantic_code_index import semantic_lookup
++from agent.training_episodes import default_episode_export_path, episode_summary, export_episodes_jsonl, iter_episodes
++from hermes_state import DEFAULT_DB_PATH
++from tools.registry import registry, tool_error
++
++
++def _json(data: Dict[str, Any]) -> str:
++    return json.dumps(data, sort_keys=True)
++
++
++TRAINING_EPISODES_SCHEMA = {
++    "name": "training_episodes",
++    "description": "Convert Hermes execution traces into privacy-minimized TrainingEpisode projections, summarize rewards, or export JSONL for eval/training.",
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "operation": {"type": "string", "enum": ["summary", "export", "preview", "replay_eval"], "description": "Operation to run."},
++            "db_path": {"type": "string", "description": "Optional Hermes state.db path. Defaults to active HERMES_HOME state.db."},
++            "output_path": {"type": "string", "description": "JSONL export path. Defaults to ~/.hermes/exports/training_episodes.jsonl."},
++            "limit": {"type": "integer", "default": 100, "minimum": 1, "maximum": 5000},
++            "ready_only": {"type": "boolean", "default": False},
++        },
++        "required": ["operation"],
++    },
++}
++
++
++def training_episodes(operation: str, db_path: str = "", output_path: str = "", limit: int = 100, ready_only: bool = False) -> str:
++    try:
++        db = Path(db_path).expanduser() if db_path else DEFAULT_DB_PATH
++        if operation == "summary":
++            return _json({"success": True, "data": episode_summary(db_path=db, limit=limit)})
++        if operation == "export":
++            out = Path(output_path).expanduser() if output_path else default_episode_export_path()
++            return _json({"success": True, "data": export_episodes_jsonl(output_path=out, db_path=db, limit=limit, ready_only=ready_only)})
++        if operation == "preview":
++            episodes = [e.to_dict() for e in iter_episodes(db_path=db, limit=min(limit, 10), ready_only=ready_only)]
++            return _json({"success": True, "data": {"episodes": episodes, "count": len(episodes)}})
++        if operation == "replay_eval":
++            episodes = list(iter_episodes(db_path=db, limit=limit, ready_only=ready_only))
++            return _json({
++                "success": True,
++                "data": {
++                    "episode_count": len(episodes),
++                    "ready_for_training_count": sum(1 for e in episodes if e.ready_for_training),
++                    "mean_reward": (sum(e.reward for e in episodes) / len(episodes) if episodes else 0.0),
++                    "extension_seam": "Feed TrainingEpisode JSONL into ART/Agent-Lightning trainer or offline policy evaluator.",
++                },
++            })
++        return tool_error(f"unsupported operation: {operation}")
++    except Exception as exc:
++        return tool_error(str(exc))
++
++
++SEMANTIC_CODE_SCHEMA = {
++    "name": "semantic_code",
++    "description": "IDE-grade semantic coding primitive: index project symbols, find symbols, go to definitions, list references, and parser diagnostics for Python/JS/TS.",
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "project_path": {"type": "string", "description": "Project root to index."},
++            "operation": {"type": "string", "enum": ["summary", "index", "find_symbol", "definition", "references", "diagnostics"]},
++            "query": {"type": "string", "description": "Symbol name or substring depending on operation."},
++            "kind": {"type": "string", "description": "Optional symbol kind filter: class/function/variable/interface/type."},
++            "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 500},
++            "include_context": {"type": "boolean", "default": False, "description": "Opt in to include raw source-line context in reference results. Defaults false for privacy/cache safety."},
++        },
++        "required": ["project_path", "operation"],
++    },
++}
++
++
++def semantic_code(project_path: str, operation: str, query: str = "", kind: str = "", limit: int = 50, include_context: bool = False) -> str:
++    try:
++        result = semantic_lookup(project_path=project_path, operation=operation, query=query or "", kind=(kind or None), limit=limit, include_context=include_context)
++        return _json({"success": True, "data": result})
++    except Exception as exc:
++        return tool_error(str(exc))
++
++
++registry.register(
++    name="training_episodes",
++    emoji="🧬",
++    toolset="self_improvement",
++    schema=TRAINING_EPISODES_SCHEMA,
++    handler=lambda args, **kw: training_episodes(
++        operation=args.get("operation", "summary"),
++        db_path=args.get("db_path", ""),
++        output_path=args.get("output_path", ""),
++        limit=int(args.get("limit") or 100),
++        ready_only=bool(args.get("ready_only") or False),
++    ),
++    description="Trace-to-RL TrainingEpisode projection/export tool",
++)
++
++registry.register(
++    name="semantic_code",
++    emoji="🧭",
++    toolset="coding",
++    schema=SEMANTIC_CODE_SCHEMA,
++    handler=lambda args, **kw: semantic_code(
++        project_path=args.get("project_path", ""),
++        operation=args.get("operation", "summary"),
++        query=args.get("query", ""),
++        kind=args.get("kind", ""),
++        limit=int(args.get("limit") or 50),
++        include_context=bool(args.get("include_context") or False),
++    ),
++    description="Semantic code index and coding primitives",
++)
+diff --git a/toolsets.py b/toolsets.py
+index 4377151fe..5f1153a18 100644
+--- a/toolsets.py
++++ b/toolsets.py
+@@ -55,6 +55,8 @@ _HERMES_CORE_TOOLS = [
+     "clarify",
+     # Code execution + delegation
+     "execute_code", "delegate_task",
++    # Self-improvement + semantic coding
++    "training_episodes", "semantic_code",
+     # Cronjob management
+     "cronjob",
+     # Cross-platform messaging (gated on gateway running via check_fn)
+@@ -187,6 +189,18 @@ TOOLSETS = {
+         "tools": ["execute_code"],
+         "includes": []
+     },
++
++    "self_improvement": {
++        "description": "Trace-to-episode export, reward scoring, and self-improvement eval substrates",
++        "tools": ["training_episodes"],
++        "includes": []
++    },
++
++    "coding": {
++        "description": "IDE-grade semantic code index primitives: symbols, definitions, references, diagnostics",
++        "tools": ["semantic_code"],
++        "includes": []
++    },
+     
+     "delegation": {
+         "description": "Spawn subagents with isolated context for complex subtasks",
+-- 
+2.51.0
+

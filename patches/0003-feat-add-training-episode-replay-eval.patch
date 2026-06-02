@@ -1,0 +1,682 @@
+From 92503c3bfc54c907aa41c2ea57cfe1ae677e1673 Mon Sep 17 00:00:00 2001
+From: mojomast <mojomast@users.noreply.github.com>
+Date: Tue, 2 Jun 2026 15:34:55 -0400
+Subject: [PATCH 3/9] feat: add training episode replay eval
+
+---
+ agent/training_episodes.py                    | 148 +++++++++++++++++-
+ .../evaluate_self_improvement_capabilities.py |  47 +++++-
+ tests/agent/test_training_episodes.py         | 142 ++++++++++++++++-
+ ..._evaluate_self_improvement_capabilities.py |  12 ++
+ tests/test_self_improvement_route_privacy.py  |  48 ++++++
+ tests/tools/test_self_improvement_tool.py     |  61 ++++++++
+ tools/self_improvement_tool.py                |  25 +--
+ 7 files changed, 463 insertions(+), 20 deletions(-)
+ create mode 100644 tests/test_evaluate_self_improvement_capabilities.py
+ create mode 100644 tests/test_self_improvement_route_privacy.py
+
+diff --git a/agent/training_episodes.py b/agent/training_episodes.py
+index f73f20b5d..ad2d0c26b 100644
+--- a/agent/training_episodes.py
++++ b/agent/training_episodes.py
+@@ -23,6 +23,7 @@ from hermes_constants import get_hermes_home
+ from hermes_state import DEFAULT_DB_PATH
+ 
+ SCHEMA_VERSION = "training_episode.v1"
++REPLAY_EVAL_SCHEMA_VERSION = "training_episode_replay_eval.v1"
+ MAX_METADATA_CHARS = 2_000
+ SECRET_RE = re.compile(r"(?i)(api[_-]?key|token|secret|password|authorization|bearer|sk-[a-z0-9])")
+ RAW_CONTENT_KEYS = {
+@@ -147,12 +148,15 @@ def _raw_payload_digest(value: Any) -> Dict[str, Any]:
+ 
+ 
+ def _is_raw_content_key(key: str) -> bool:
+-    """Return True for raw-payload fields, including common compound aliases."""
++    """Return True for raw-payload fields, including compound/camel aliases."""
+     normalized = key.lower()
+     if normalized in RAW_CONTENT_KEYS:
+         return True
+     key_parts = [part for part in re.split(r"[^a-z0-9]+", normalized) if part]
+-    return any(part in RAW_CONTENT_KEY_MARKERS for part in key_parts)
++    if any(part in RAW_CONTENT_KEY_MARKERS for part in key_parts):
++        return True
++    compacted = "".join(key_parts) or normalized
++    return any(marker in compacted for marker in RAW_CONTENT_KEY_MARKERS)
+ 
+ 
+ def _minimize_value(value: Any) -> Any:
+@@ -288,6 +292,146 @@ def iter_episodes(db_path: Path = DEFAULT_DB_PATH, limit: int = 100, min_reward:
+             yield episode
+ 
+ 
++def _is_raw_payload_descriptor(value: Any) -> bool:
++    return (
++        isinstance(value, dict)
++        and value.get("redacted") == RAW_PAYLOAD_REDACTION
++        and isinstance(value.get("length"), int)
++        and isinstance(value.get("sha256_prefix"), str)
++        and len(value.get("sha256_prefix", "")) >= 8
++    )
++
++
++def _walk_metadata_raw_keys(value: Any, path: str = "metadata") -> Iterable[tuple[str, Any]]:
++    if isinstance(value, dict):
++        for key, child in value.items():
++            child_path = f"{path}.{key}"
++            if _is_raw_content_key(str(key)):
++                yield child_path, child
++            yield from _walk_metadata_raw_keys(child, child_path)
++    elif isinstance(value, list):
++        for index, child in enumerate(value[:50]):
++            yield from _walk_metadata_raw_keys(child, f"{path}[{index}]")
++
++
++def privacy_findings_for_episode(episode: TrainingEpisode | Dict[str, Any], *, forbidden_substrings: Iterable[str] = ()) -> List[Dict[str, Any]]:
++    """Return privacy regression findings for a minimized TrainingEpisode.
++
++    Findings never echo raw forbidden content; canaries are represented by hash
++    prefixes so eval output remains safe to store/share.
++    """
++    data = episode.to_dict() if isinstance(episode, TrainingEpisode) else dict(episode)
++    findings: List[Dict[str, Any]] = []
++    blob = json.dumps(data, sort_keys=True, default=str)
++
++    if data.get("privacy", {}).get("raw_content_exported") is True:
++        findings.append({"code": "raw_content_exported_true", "message": "Episode privacy metadata reports raw content export."})
++
++    for substring in forbidden_substrings:
++        if substring and substring in blob:
++            digest = hashlib.sha256(str(substring).encode("utf-8", "replace")).hexdigest()[:16]
++            findings.append({"code": "forbidden_substring_present", "message": "Forbidden substring appeared in episode JSON.", "substring_sha256_prefix": digest})
++
++    for step_index, step in enumerate(data.get("steps", [])):
++        metadata = step.get("metadata", {}) if isinstance(step, dict) else {}
++        for path, value in _walk_metadata_raw_keys(metadata, f"steps[{step_index}].metadata"):
++            if not _is_raw_payload_descriptor(value):
++                findings.append({"code": "raw_payload_key_without_digest", "message": "Raw-payload metadata key did not contain a redacted digest descriptor.", "path": path})
++
++    return findings
++
++
++def replay_episode_eval(episode: TrainingEpisode, *, min_reward: float = 1.0, require_ready: bool = True, forbidden_substrings: Iterable[str] = ()) -> Dict[str, Any]:
++    """Deterministically evaluate one minimized TrainingEpisode projection."""
++    privacy_findings = privacy_findings_for_episode(episode, forbidden_substrings=forbidden_substrings)
++    reasons: List[str] = []
++    if episode.reward < min_reward:
++        reasons.append("reward_below_min")
++    if require_ready and not episode.ready_for_training:
++        reasons.append("not_ready_for_training")
++    if not episode.steps:
++        reasons.append("no_steps")
++    if not any(sig.name == "has_final_answer" and bool(sig.value) for sig in episode.outcome_signals):
++        reasons.append("missing_final_answer_signal")
++    if privacy_findings:
++        reasons.append("privacy_findings_present")
++
++    return {
++        "episode_id": episode.episode_id,
++        "trace_id": episode.trace_id,
++        "trace_status": episode.trace_status,
++        "ready_for_training": episode.ready_for_training,
++        "reward": episode.reward,
++        "step_count": len(episode.steps),
++        "outcome_signal_count": len(episode.outcome_signals),
++        "passed": not reasons,
++        "reasons": reasons,
++        "privacy_finding_count": len(privacy_findings),
++    }
++
++
++def replay_eval_episodes(
++    db_path: Path = DEFAULT_DB_PATH,
++    *,
++    limit: int = 100,
++    ready_only: bool = False,
++    min_reward: float = 1.0,
++    require_ready: bool = True,
++    include_episodes: bool = False,
++    max_failures: int = 20,
++    forbidden_substrings: Iterable[str] = (),
++) -> Dict[str, Any]:
++    """Run deterministic replay/eval over recent TrainingEpisode projections."""
++    start = time.perf_counter()
++    episodes = list(iter_episodes(db_path=db_path, limit=limit, ready_only=ready_only))
++    rows = [replay_episode_eval(e, min_reward=min_reward, require_ready=require_ready, forbidden_substrings=forbidden_substrings) for e in episodes]
++    rewards = [e.reward for e in episodes]
++    privacy_findings: List[Dict[str, Any]] = []
++    outcome_signal_totals: Dict[str, float] = {}
++    for episode in episodes:
++        privacy_findings.extend(privacy_findings_for_episode(episode, forbidden_substrings=forbidden_substrings))
++        for signal in episode.outcome_signals:
++            value = signal.value
++            if isinstance(value, bool):
++                numeric = 1.0 if value else 0.0
++            elif isinstance(value, (int, float)):
++                numeric = float(value)
++            else:
++                numeric = 1.0 if value else 0.0
++            outcome_signal_totals[signal.name] = outcome_signal_totals.get(signal.name, 0.0) + numeric
++
++    failed_rows = [row for row in rows if not row["passed"]]
++    elapsed_ms = int((time.perf_counter() - start) * 1000)
++    result: Dict[str, Any] = {
++        "schema_version": REPLAY_EVAL_SCHEMA_VERSION,
++        "ok": not failed_rows and not privacy_findings,
++        "db_path": str(db_path),
++        "limit": int(limit),
++        "ready_only": bool(ready_only),
++        "thresholds": {"min_reward": min_reward, "require_ready": require_ready},
++        "episode_count": len(episodes),
++        "evaluated_count": len(rows),
++        "passed_count": len(rows) - len(failed_rows),
++        "failed_count": len(failed_rows),
++        "ready_for_training_count": sum(1 for e in episodes if e.ready_for_training),
++        "avg_reward": (sum(rewards) / len(rewards) if rewards else 0.0),
++        "min_observed_reward": (min(rewards) if rewards else 0.0),
++        "max_observed_reward": (max(rewards) if rewards else 0.0),
++        "outcome_signal_totals": outcome_signal_totals,
++        "privacy": {
++            "raw_content_exported": False,
++            "checked_episode_count": len(episodes),
++            "finding_count": len(privacy_findings),
++            "findings": privacy_findings[:max_failures],
++        },
++        "failures": failed_rows[:max_failures],
++        "elapsed_ms": elapsed_ms,
++    }
++    if include_episodes:
++        result["episodes"] = rows
++    return result
++
++
+ def export_episodes_jsonl(output_path: Path, db_path: Path = DEFAULT_DB_PATH, limit: int = 100, ready_only: bool = False) -> Dict[str, Any]:
+     output_path = Path(output_path)
+     output_path.parent.mkdir(parents=True, exist_ok=True)
+diff --git a/scripts/evaluate_self_improvement_capabilities.py b/scripts/evaluate_self_improvement_capabilities.py
+index 669f6263a..c9a536e07 100755
+--- a/scripts/evaluate_self_improvement_capabilities.py
++++ b/scripts/evaluate_self_improvement_capabilities.py
+@@ -17,7 +17,7 @@ from pathlib import Path
+ 
+ from agent.semantic_code_index import get_diagnostics, go_to_definition, list_references, semantic_lookup
+ from agent.tracing import TraceRecorder, hash_user_message
+-from agent.training_episodes import export_episodes_jsonl, iter_episodes
++from agent.training_episodes import export_episodes_jsonl, iter_episodes, replay_eval_episodes
+ from hermes_state import SessionDB
+ 
+ 
+@@ -52,14 +52,21 @@ def make_code_fixture(root: Path) -> None:
+     (root / "index.ts").write_text("export function loadUser() { return { name: 'Ada' } }\n", encoding="utf-8")
+ 
+ 
+-def run_eval() -> dict:
++def run_eval(*, db_path: Path | None = None, limit: int = 100, ready_only: bool = False, min_reward: float = 1.0, require_ready: bool = True, include_episodes: bool = False) -> dict:
+     with tempfile.TemporaryDirectory(prefix="hermes-self-improve-eval-") as tmp:
+         tmp_path = Path(tmp)
+-        db_path = tmp_path / "state.db"
+-        make_trace(db_path)
++        fixture_db_path = tmp_path / "state.db"
++        make_trace(fixture_db_path)
+         trace_start = time.perf_counter()
+-        episodes = list(iter_episodes(db_path=db_path, limit=10))
+-        export = export_episodes_jsonl(tmp_path / "episodes.jsonl", db_path=db_path)
++        episodes = list(iter_episodes(db_path=fixture_db_path, limit=10))
++        export = export_episodes_jsonl(tmp_path / "episodes.jsonl", db_path=fixture_db_path)
++        fixture_replay = replay_eval_episodes(
++            db_path=fixture_db_path,
++            limit=10,
++            min_reward=min_reward,
++            require_ready=require_ready,
++            include_episodes=include_episodes,
++        )
+         trace_ms = int((time.perf_counter() - trace_start) * 1000)
+ 
+         code_root = tmp_path / "code"
+@@ -71,7 +78,7 @@ def run_eval() -> dict:
+         diags = get_diagnostics(code_root)
+         code_ms = int((time.perf_counter() - code_start) * 1000)
+ 
+-        return {
++        result = {
+             "trace_to_rl": {
+                 "episode_count": len(episodes),
+                 "ready_for_training": sum(1 for e in episodes if e.ready_for_training),
+@@ -80,6 +87,7 @@ def run_eval() -> dict:
+                 "conversion_and_export_latency_ms": trace_ms,
+                 "export": export,
+             },
++            "fixture_replay_eval": fixture_replay,
+             "semantic_coding": {
+                 "file_count": summary["file_count"],
+                 "languages": summary["languages"],
+@@ -91,13 +99,36 @@ def run_eval() -> dict:
+                 "lookup_latency_ms": code_ms,
+             },
+         }
++        if db_path is not None:
++            result["training_episode_replay_eval"] = replay_eval_episodes(
++                db_path=db_path,
++                limit=limit,
++                ready_only=ready_only,
++                min_reward=min_reward,
++                require_ready=require_ready,
++                include_episodes=include_episodes,
++            )
++        return result
+ 
+ 
+ def main() -> int:
+     parser = argparse.ArgumentParser()
+     parser.add_argument("--output-json", type=Path)
++    parser.add_argument("--db-path", type=Path, help="Optional Hermes state DB to replay/eval in addition to the synthetic fixture.")
++    parser.add_argument("--limit", type=int, default=100)
++    parser.add_argument("--ready-only", action="store_true")
++    parser.add_argument("--min-reward", type=float, default=1.0)
++    parser.add_argument("--no-require-ready", action="store_true")
++    parser.add_argument("--include-episodes", action="store_true")
+     args = parser.parse_args()
+-    result = run_eval()
++    result = run_eval(
++        db_path=args.db_path,
++        limit=args.limit,
++        ready_only=args.ready_only,
++        min_reward=args.min_reward,
++        require_ready=not args.no_require_ready,
++        include_episodes=args.include_episodes,
++    )
+     text = json.dumps(result, indent=2, sort_keys=True)
+     if args.output_json:
+         args.output_json.parent.mkdir(parents=True, exist_ok=True)
+diff --git a/tests/agent/test_training_episodes.py b/tests/agent/test_training_episodes.py
+index fd89024a8..c23fd936c 100644
+--- a/tests/agent/test_training_episodes.py
++++ b/tests/agent/test_training_episodes.py
+@@ -1,7 +1,14 @@
+ import json
+ 
+ from agent.tracing import TraceRecorder, hash_user_message
+-from agent.training_episodes import export_episodes_jsonl, episode_summary, iter_episodes, trace_to_episode
++from agent.training_episodes import (
++    export_episodes_jsonl,
++    episode_summary,
++    iter_episodes,
++    replay_eval_episodes,
++    replay_episode_eval,
++    trace_to_episode,
++)
+ from hermes_state import SessionDB
+ 
+ 
+@@ -46,6 +53,7 @@ def test_raw_content_keys_redact_non_secret_private_text():
+     private_prompt = "prompt asked about a confidential family matter"
+     private_response = "assistant response included patient name lavender otter"
+     private_transcript = "call transcript included home address marmalade lane"
++    private_model_output = "model output included private investor note teal fox"
+     trace = {
+         "trace_id": "trace-raw-redaction",
+         "session_id": "sess",
+@@ -72,6 +80,7 @@ def test_raw_content_keys_redact_non_secret_private_text():
+                     "nested": {"prompt": private_prompt},
+                     "tool_response": private_response,
+                     "chat_history_transcript": private_transcript,
++                    "modelOutput": private_model_output,
+                 }
+             ),
+         },
+@@ -94,6 +103,7 @@ def test_raw_content_keys_redact_non_secret_private_text():
+     assert private_prompt not in episode_blob
+     assert private_response not in episode_blob
+     assert private_transcript not in episode_blob
++    assert private_model_output not in episode_blob
+ 
+ 
+ def test_nested_list_metadata_redacts_raw_payloads_and_secrets():
+@@ -171,3 +181,133 @@ def test_export_jsonl_and_summary_report_latency(tmp_path):
+     assert summary["episode_count"] == 1
+     assert summary["ready_for_training_count"] == 1
+     assert summary["conversion_latency_ms"] >= 0
++
++
++def test_replay_eval_episodes_passes_ready_trace(tmp_path):
++    db_path = tmp_path / "state.db"
++    _record_fixture_trace(db_path)
++
++    result = replay_eval_episodes(db_path=db_path, limit=10, min_reward=1.0)
++
++    assert result["schema_version"] == "training_episode_replay_eval.v1"
++    assert result["ok"] is True
++    assert result["episode_count"] == 1
++    assert result["evaluated_count"] == 1
++    assert result["passed_count"] == 1
++    assert result["failed_count"] == 0
++    assert result["ready_for_training_count"] == 1
++    assert result["privacy"]["raw_content_exported"] is False
++    assert result["privacy"]["finding_count"] == 0
++    assert result["failures"] == []
++    assert result["elapsed_ms"] >= 0
++
++
++def test_replay_eval_episodes_flags_failed_trace(tmp_path):
++    db_path = tmp_path / "state.db"
++    _record_fixture_trace(db_path, error=True)
++
++    result = replay_eval_episodes(db_path=db_path, limit=10, min_reward=1.0)
++
++    assert result["ok"] is False
++    assert result["episode_count"] == 1
++    assert result["passed_count"] == 0
++    assert result["failed_count"] == 1
++    assert result["failures"]
++    assert result["failures"][0]["ready_for_training"] is False
++    assert "not_ready_for_training" in result["failures"][0]["reasons"]
++    assert "reward_below_min" in result["failures"][0]["reasons"]
++
++
++def test_replay_eval_episodes_can_include_compact_episode_rows(tmp_path):
++    db_path = tmp_path / "state.db"
++    _record_fixture_trace(db_path)
++
++    result = replay_eval_episodes(db_path=db_path, limit=10, min_reward=1.0, include_episodes=True)
++
++    assert "episodes" in result
++    assert len(result["episodes"]) == 1
++    row = result["episodes"][0]
++    assert row["episode_id"].startswith("episode:")
++    assert row["trace_id"]
++    assert row["passed"] is True
++    assert "steps" not in row
++    assert "metadata" not in json.dumps(row)
++
++
++def test_replay_eval_privacy_regression_forbidden_substrings_not_exported():
++    private_result = "private launch codename velvet-mango"
++    private_prompt = "confidential family matter orange-badger"
++    private_stdout = "internal migration note silver-ferret"
++    trace = {
++        "trace_id": "trace-privacy-replay",
++        "session_id": "sess",
++        "turn_id": "turn",
++        "user_message_hash": "hash",
++        "start_time": 1.0,
++        "end_time": 2.0,
++        "total_wall_ms": 1000,
++        "total_model_calls": 1,
++        "status": "completed",
++    }
++    spans = [
++        {
++            "span_type": "tool_call",
++            "name": "terminal",
++            "status": "completed",
++            "start_time": 1.0,
++            "end_time": 1.1,
++            "error_class": None,
++            "metadata_json": json.dumps({"result": private_result, "stdout": private_stdout, "nested": {"prompt": private_prompt}}),
++        },
++        {
++            "span_type": "final_answer",
++            "name": "turn.final_answer",
++            "status": "completed",
++            "start_time": 1.1,
++            "end_time": 2.0,
++            "error_class": None,
++            "metadata_json": json.dumps({"completed": True}),
++        },
++    ]
++
++    episode = trace_to_episode(trace, spans)
++    row = replay_episode_eval(episode, min_reward=1.0, forbidden_substrings=[private_result, private_prompt, private_stdout])
++    blob = json.dumps(episode.to_dict())
++
++    assert row["privacy_finding_count"] == 0
++    assert row["passed"] is True
++    assert private_result not in blob
++    assert private_prompt not in blob
++    assert private_stdout not in blob
++    assert "[REDACTED_RAW_PAYLOAD]" in blob
++
++
++def test_export_jsonl_privacy_regression_redacts_raw_payloads(tmp_path):
++    private_result = "PRIVATE_EXPORT_RESULT_MANGO"
++    private_stdout = "PRIVATE_EXPORT_STDOUT_OTTER"
++    private_response = "PRIVATE_EXPORT_RESPONSE_LAVENDER"
++    private_prompt = "PRIVATE_EXPORT_PROMPT_VELVET"
++    db_path = tmp_path / "state.db"
++    db = SessionDB(db_path)
++    try:
++        recorder = TraceRecorder(session_id="sess", turn_id="turn", user_message_hash=hash_user_message("private export prompt"))
++        with recorder.span("turn", "root"):
++            with recorder.span("tool_call", "terminal", {"result": private_result, "stdout": private_stdout, "tool_response": private_response, "nested": {"prompt": private_prompt}, "api_key": "sk-test-private"}):
++                pass
++            with recorder.span("final_answer", "turn.final_answer", {"completed": True}):
++                pass
++        recorder.finish("completed")
++        db.record_trace(recorder.to_trace_row(), recorder.to_span_rows())
++    finally:
++        db.close()
++
++    out = tmp_path / "episodes.jsonl"
++    export_episodes_jsonl(out, db_path=db_path, limit=10)
++    text = out.read_text(encoding="utf-8")
++    row = json.loads(text.splitlines()[0])
++
++    assert "[REDACTED_RAW_PAYLOAD]" in text
++    assert "[REDACTED]" in text
++    assert row["privacy"]["raw_content_exported"] is False
++    for private_value in [private_result, private_stdout, private_response, private_prompt, "private export prompt", "sk-test-private"]:
++        assert private_value not in text
+diff --git a/tests/test_evaluate_self_improvement_capabilities.py b/tests/test_evaluate_self_improvement_capabilities.py
+new file mode 100644
+index 000000000..59665e89a
+--- /dev/null
++++ b/tests/test_evaluate_self_improvement_capabilities.py
+@@ -0,0 +1,12 @@
++from scripts.evaluate_self_improvement_capabilities import run_eval
++
++
++def test_evaluate_self_improvement_capabilities_includes_fixture_replay_eval():
++    result = run_eval(limit=10, min_reward=1.0)
++
++    assert "fixture_replay_eval" in result
++    replay = result["fixture_replay_eval"]
++    assert replay["schema_version"] == "training_episode_replay_eval.v1"
++    assert replay["episode_count"] == 1
++    assert replay["passed_count"] == 1
++    assert replay["privacy"]["finding_count"] == 0
+diff --git a/tests/test_self_improvement_route_privacy.py b/tests/test_self_improvement_route_privacy.py
+new file mode 100644
+index 000000000..88522b039
+--- /dev/null
++++ b/tests/test_self_improvement_route_privacy.py
+@@ -0,0 +1,48 @@
++import json
++
++import pytest
++
++
++@pytest.mark.asyncio
++async def test_semantic_index_route_default_omits_reference_context(tmp_path):
++    from hermes_cli.web_server import get_semantic_index
++
++    project = tmp_path / "private-route"
++    project.mkdir()
++    private_line = "SECRET_SNIPPET = 'PRIVATE_ROUTE_CONTEXT_MANGO'"
++    (project / "secret.py").write_text(f"{private_line}\ndef use_secret():\n    return SECRET_SNIPPET\n", encoding="utf-8")
++
++    result = await get_semantic_index(project_path=str(project), operation="references", query="SECRET_SNIPPET")
++    blob = json.dumps(result)
++
++    assert result["total"] >= 2
++    assert all(ref.get("context", "") == "" for ref in result["references"])
++    assert "PRIVATE_ROUTE_CONTEXT_MANGO" not in blob
++
++
++@pytest.mark.asyncio
++async def test_training_episode_summary_route_is_summary_only(monkeypatch):
++    from hermes_cli import web_server
++
++    captured = {}
++
++    def fake_episode_summary(*, limit):
++        captured["limit"] = limit
++        return {
++            "schema_version": "training_episode.v1",
++            "episode_count": 1,
++            "ready_for_training_count": 1,
++            "recent_rewards": [4.47],
++            "avg_reward": 4.47,
++            "conversion_latency_ms": 0,
++        }
++
++    monkeypatch.setattr("agent.training_episodes.episode_summary", fake_episode_summary)
++
++    result = await web_server.get_training_episode_summary(limit=999999)
++    blob = json.dumps(result)
++
++    assert captured["limit"] == 1000
++    assert result["episode_count"] == 1
++    for forbidden_key in ["episodes", "steps", "metadata", "prompt", "content", "stdout", "stderr", "args", "arguments"]:
++        assert forbidden_key not in blob
+diff --git a/tests/tools/test_self_improvement_tool.py b/tests/tools/test_self_improvement_tool.py
+index 665331b21..43c9a8262 100644
+--- a/tests/tools/test_self_improvement_tool.py
++++ b/tests/tools/test_self_improvement_tool.py
+@@ -1,5 +1,7 @@
+ import json
+ 
++from agent.tracing import TraceRecorder, hash_user_message
++from hermes_state import SessionDB
+ from model_tools import discover_builtin_tools
+ from tools.registry import registry
+ from toolsets import resolve_toolset
+@@ -23,3 +25,62 @@ def test_semantic_code_tool_smoke(tmp_path):
+     result = json.loads(tool.handler({"project_path": str(project), "operation": "definition", "query": "f"}))
+     assert result["success"] is True
+     assert result["data"]["definitions"][0]["line"] == 1
++
++
++def test_training_episodes_tool_replay_eval(tmp_path):
++    discover_builtin_tools()
++    db_path = tmp_path / "state.db"
++    db = SessionDB(db_path)
++    try:
++        recorder = TraceRecorder(session_id="sess", turn_id="turn", user_message_hash=hash_user_message("tool replay eval fixture"))
++        with recorder.span("turn", "root"):
++            with recorder.span("model_call", "llm_api_call"):
++                pass
++            with recorder.span("tool_call", "terminal", {"arg_count": 1}):
++                pass
++            with recorder.span("final_answer", "turn.final_answer", {"completed": True}):
++                pass
++        recorder.finish("completed")
++        db.record_trace(recorder.to_trace_row(), recorder.to_span_rows())
++    finally:
++        db.close()
++
++    tool = registry.get_entry("training_episodes")
++    result = json.loads(tool.handler({"operation": "replay_eval", "db_path": str(db_path), "limit": 10, "min_reward": 1.0, "require_ready": True, "include_episodes": True}))
++
++    assert result["success"] is True
++    data = result["data"]
++    assert data["schema_version"] == "training_episode_replay_eval.v1"
++    assert data["ok"] is True
++    assert data["episode_count"] == 1
++    assert data["passed_count"] == 1
++    assert data["privacy"]["finding_count"] == 0
++    assert len(data["episodes"]) == 1
++
++
++def test_training_episodes_schema_exposes_replay_eval_args():
++    discover_builtin_tools()
++    entry = registry.get_entry("training_episodes")
++    props = entry.schema["parameters"]["properties"]
++
++    assert "min_reward" in props
++    assert "require_ready" in props
++    assert "include_episodes" in props
++    assert "replay_eval" in props["operation"]["enum"]
++
++
++def test_semantic_code_tool_references_default_omits_context(tmp_path):
++    discover_builtin_tools()
++    project = tmp_path / "private"
++    project.mkdir()
++    private_line = "SECRET_SNIPPET = 'PRIVATE_TOOL_CONTEXT_MANGO'"
++    (project / "secret.py").write_text(f"{private_line}\ndef use_secret():\n    return SECRET_SNIPPET\n", encoding="utf-8")
++
++    tool = registry.get_entry("semantic_code")
++    result = json.loads(tool.handler({"project_path": str(project), "operation": "references", "query": "SECRET_SNIPPET"}))
++    blob = json.dumps(result)
++
++    assert result["success"] is True
++    assert result["data"]["total"] >= 2
++    assert all(ref.get("context", "") == "" for ref in result["data"]["references"])
++    assert "PRIVATE_TOOL_CONTEXT_MANGO" not in blob
+diff --git a/tools/self_improvement_tool.py b/tools/self_improvement_tool.py
+index 6ced3ad89..2f7dab49d 100644
+--- a/tools/self_improvement_tool.py
++++ b/tools/self_improvement_tool.py
+@@ -6,7 +6,7 @@ from pathlib import Path
+ from typing import Any, Dict
+ 
+ from agent.semantic_code_index import semantic_lookup
+-from agent.training_episodes import default_episode_export_path, episode_summary, export_episodes_jsonl, iter_episodes
++from agent.training_episodes import default_episode_export_path, episode_summary, export_episodes_jsonl, iter_episodes, replay_eval_episodes
+ from hermes_state import DEFAULT_DB_PATH
+ from tools.registry import registry, tool_error
+ 
+@@ -26,13 +26,16 @@ TRAINING_EPISODES_SCHEMA = {
+             "output_path": {"type": "string", "description": "JSONL export path. Defaults to ~/.hermes/exports/training_episodes.jsonl."},
+             "limit": {"type": "integer", "default": 100, "minimum": 1, "maximum": 5000},
+             "ready_only": {"type": "boolean", "default": False},
++            "min_reward": {"type": "number", "default": 1.0, "description": "Minimum acceptable reward for replay_eval."},
++            "require_ready": {"type": "boolean", "default": True, "description": "Fail replay_eval rows that are not ready_for_training."},
++            "include_episodes": {"type": "boolean", "default": False, "description": "Include compact per-episode replay/eval rows."},
+         },
+         "required": ["operation"],
+     },
+ }
+ 
+ 
+-def training_episodes(operation: str, db_path: str = "", output_path: str = "", limit: int = 100, ready_only: bool = False) -> str:
++def training_episodes(operation: str, db_path: str = "", output_path: str = "", limit: int = 100, ready_only: bool = False, min_reward: float = 1.0, require_ready: bool = True, include_episodes: bool = False) -> str:
+     try:
+         db = Path(db_path).expanduser() if db_path else DEFAULT_DB_PATH
+         if operation == "summary":
+@@ -44,15 +47,16 @@ def training_episodes(operation: str, db_path: str = "", output_path: str = "",
+             episodes = [e.to_dict() for e in iter_episodes(db_path=db, limit=min(limit, 10), ready_only=ready_only)]
+             return _json({"success": True, "data": {"episodes": episodes, "count": len(episodes)}})
+         if operation == "replay_eval":
+-            episodes = list(iter_episodes(db_path=db, limit=limit, ready_only=ready_only))
+             return _json({
+                 "success": True,
+-                "data": {
+-                    "episode_count": len(episodes),
+-                    "ready_for_training_count": sum(1 for e in episodes if e.ready_for_training),
+-                    "mean_reward": (sum(e.reward for e in episodes) / len(episodes) if episodes else 0.0),
+-                    "extension_seam": "Feed TrainingEpisode JSONL into ART/Agent-Lightning trainer or offline policy evaluator.",
+-                },
++                "data": replay_eval_episodes(
++                    db_path=db,
++                    limit=limit,
++                    ready_only=ready_only,
++                    min_reward=min_reward,
++                    require_ready=require_ready,
++                    include_episodes=include_episodes,
++                ),
+             })
+         return tool_error(f"unsupported operation: {operation}")
+     except Exception as exc:
+@@ -96,6 +100,9 @@ registry.register(
+         output_path=args.get("output_path", ""),
+         limit=int(args.get("limit") or 100),
+         ready_only=bool(args.get("ready_only") or False),
++        min_reward=float(args.get("min_reward") if args.get("min_reward") is not None else 1.0),
++        require_ready=bool(args.get("require_ready") if args.get("require_ready") is not None else True),
++        include_episodes=bool(args.get("include_episodes") or False),
+     ),
+     description="Trace-to-RL TrainingEpisode projection/export tool",
+ )
+-- 
+2.51.0
+

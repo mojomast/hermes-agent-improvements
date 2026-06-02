@@ -1,0 +1,2165 @@
+From 6c601d2987ee860a193f95c1807ddc4457d2102b Mon Sep 17 00:00:00 2001
+From: mojomast <mojomast@users.noreply.github.com>
+Date: Tue, 2 Jun 2026 18:13:10 -0400
+Subject: [PATCH 5/9] routing: add deterministic task router evaluation harness
+
+---
+ agent/task_router.py                        | 503 ++++++++++++++++
+ agent/task_router_eval.py                   | 603 ++++++++++++++++++++
+ scripts/benchmark_task_router_configs.py    | 129 +++++
+ scripts/evaluate_task_router.py             | 126 ++++
+ tests/agent/test_task_router.py             | 205 +++++++
+ tests/agent/test_task_router_eval.py        | 503 ++++++++++++++++
+ tests/fixtures/task_router_eval_cases.jsonl |  29 +
+ 7 files changed, 2098 insertions(+)
+ create mode 100644 agent/task_router.py
+ create mode 100644 agent/task_router_eval.py
+ create mode 100644 scripts/benchmark_task_router_configs.py
+ create mode 100644 scripts/evaluate_task_router.py
+ create mode 100644 tests/agent/test_task_router.py
+ create mode 100644 tests/agent/test_task_router_eval.py
+ create mode 100644 tests/fixtures/task_router_eval_cases.jsonl
+
+diff --git a/agent/task_router.py b/agent/task_router.py
+new file mode 100644
+index 000000000..ab4a692ff
+--- /dev/null
++++ b/agent/task_router.py
+@@ -0,0 +1,503 @@
++"""Pure heuristic routing for Hermes task execution efficiency.
++
++This module is deliberately side-effect free: no config reads, no tool imports,
++no model calls, and no filesystem access.  It provides a small deterministic
++surface that later integration code can use to decide whether a request should
++stay serial, be handled as a single-agent batch, or fan out to parallel
++subagents.
++"""
++
++from __future__ import annotations
++
++import enum
++import re
++from dataclasses import dataclass, field
++from typing import Any, Iterable, Mapping
++
++
++class TaskRoute(enum.Enum):
++    """Execution route categories for a user/task prompt."""
++
++    SERIAL = "serial"
++    BATCHED_SINGLE_AGENT = "batched_single_agent"
++    PARALLEL_SUBAGENTS = "parallel_subagents"
++
++
++@dataclass(frozen=True)
++class TaskRouterConfig:
++    """Tunable thresholds for the pure task router."""
++
++    enable_parallel_subagents: bool = True
++    min_parallel_subtasks: int = 3
++    max_parallel_subagents: int = 4
++
++
++@dataclass(frozen=True)
++class RoutedSubtask:
++    """A best-effort suggested subtask for future delegate_task fanout."""
++
++    goal: str
++    context: str = ""
++    toolsets: tuple[str, ...] = ()
++
++    def to_dict(self) -> dict[str, Any]:
++        payload: dict[str, Any] = {"goal": self.goal, "context": self.context}
++        if self.toolsets:
++            payload["toolsets"] = list(self.toolsets)
++        return payload
++
++
++@dataclass(frozen=True)
++class TaskRouteDecision:
++    """Serializable routing decision with stable reason codes and metrics."""
++
++    route: TaskRoute
++    reasons: tuple[str, ...]
++    metrics: Mapping[str, int | bool]
++    subtasks: tuple[RoutedSubtask, ...] = field(default_factory=tuple)
++
++    @property
++    def should_delegate(self) -> bool:
++        return self.route is TaskRoute.PARALLEL_SUBAGENTS
++
++    def to_dict(self) -> dict[str, Any]:
++        return {
++            "route": self.route.value,
++            "reasons": list(self.reasons),
++            "metrics": dict(self.metrics),
++            "subtasks": [subtask.to_dict() for subtask in self.subtasks],
++            "should_delegate": self.should_delegate,
++        }
++
++
++_SIMPLE_PATTERNS = (
++    r"^\s*what\s+is\b",
++    r"^\s*what\s+are\b",
++    r"^\s*explain\b",
++    r"^\s*summarize\s+this\b",
++    r"^\s*calculate\b",
++    r"^\s*convert\b",
++    r"^\s*format\b",
++)
++_DEPENDENCY_PATTERNS = (
++    r"\bfirst\b.*\bthen\b",
++    r"\bthen\b",
++    r"\bafter\s+that\b",
++    r"\bonce\s+(?:that|the|you|we|i)\b",
++    r"\bbased on (that|the|what)\b",
++    r"\bstep by step\b",
++)
++_SAFETY_PATTERNS = (
++    r"\bdelete\b",
++    r"\bdeleting\b",
++    r"\bforce\s+push\b",
++    r"\bproduction\s+secrets?\b",
++    r"\bdeployment\s+credentials?\b",
++    r"\bdatabase\s+migration\b",
++    r"\bmigrate\b",
++    r"\bdestroy\w*\b",
++    r"\bdestructive\b",
++    r"\bapi\s+keys?\b",
++    r"\bpasswords?\b",
++    r"\boauth\s+tokens?\b",
++    r"\bprivate\s+keys?\b",
++    r"\bssh\s+keys?\b",
++    r"\baccess\s+tokens?\b",
++)
++_WRITE_PATTERNS = (
++    r"\bedit\b",
++    r"\bmodify\b",
++    r"\brewrite\b",
++    r"\brefactor\b",
++    r"\bfix\b",
++    r"\bimplement\b",
++    r"\bupdate\b",
++    r"\bapply\b",
++    r"\bcreate\b",
++)
++_PARALLEL_PATTERNS = (
++    r"\bindependently\b",
++    r"\bin parallel\b",
++    r"\bsimultaneously\b",
++    r"\bcompare\b",
++    r"\bcontrast\b",
++)
++_EXPLICIT_DELEGATION_PATTERNS = (
++    r"\buse\s+(?:\w+\s+)?(?:parallel\s+)?subagents?\b",
++    r"\bparallel\s+subagents?\b",
++    r"\bdelegate\b.*\bagents?\b",
++    r"\bseparate\s+agents?\b",
++    r"\bfan\s+out\b",
++    r"\bspawn\b.*\bagents?\b",
++    r"\bsplit\b.*\bacross\s+agents?\b",
++)
++_FORBID_DELEGATION_PATTERNS = (
++    r"\bdo\s+not\s+use\s+(?:any\s+)?(?:parallel\s+)?subagents?\b",
++    r"\bdon't\s+use\s+(?:any\s+)?(?:parallel\s+)?subagents?\b",
++    r"\bno\s+(?:parallel\s+)?subagents?\b",
++    r"\bwithout\s+(?:using\s+)?(?:any\s+)?(?:parallel\s+)?subagents?\b",
++    r"\bsingle\s+agent\s+only\b",
++    r"\bkeep\s+it\s+serial\b",
++)
++_READONLY_PATTERNS = (
++    r"\bresearch\b",
++    r"\binvestigate\b",
++    r"\banaly[sz]e\b",
++    r"\baudit\b",
++    r"\breview\b",
++    r"\bcompare\b",
++    r"\bevaluate\b",
++    r"\binspect\b",
++    r"\bcheck\b",
++    r"\btriage\b",
++    r"\bread[- ]only\b",
++)
++_READONLY_GUARD_CLAUSE_RE = re.compile(
++    r"(?:^|[.;,])\s*(?:"
++    r"do\s+not\s+(?:modify|edit|update|change|write|apply|create|rewrite|refactor)(?:\s+(?:files?|changes?))?"
++    r"|don't\s+(?:modify|edit|update|change|write|apply|create|rewrite|refactor)(?:\s+(?:files?|changes?))?"
++    r"|no\s+(?:file\s+)?(?:changes?|modifications?|edits?|writes?)"
++    r"|without\s+(?:modifying|editing|updating|changing|writing|applying|creating|rewriting|refactoring)(?:\s+(?:files?|changes?))?"
++    r"|read[- ]only(?:\s+(?:review|audit|analysis|mode|only))?"
++    r"|report\s+only"
++    r")\.?\s*(?=$|[.;,])",
++    re.IGNORECASE,
++)
++_HOMOGENEOUS_PATTERNS = (
++    r"\bsame\b",
++    r"\beach\b",
++    r"\bevery\b",
++    r"\bformatting cleanup\b",
++    r"\bmatching imports\b",
++)
++
++
++def route_task(
++    task: str,
++    *,
++    config: TaskRouterConfig | None = None,
++) -> TaskRouteDecision:
++    """Classify a task prompt into serial, batched, or parallel execution.
++
++    The router is conservative by design: when signals conflict, it prefers
++    serial/batched execution over spawning subagents.  It returns machine-stable
++    reason codes and simple metrics so behavior can be benchmarked over time.
++    """
++
++    cfg = config or TaskRouterConfig()
++    raw = task or ""
++    normalized = _normalize(raw)
++    reasons: list[str] = []
++
++    if not normalized:
++        return _decision(
++            TaskRoute.SERIAL,
++            ["empty_task"],
++            estimated_subtasks=0,
++            parallelizable_subtasks=0,
++            recommended_subagents=0,
++            requires_shared_context=False,
++            has_dependencies=False,
++            safety_risk=False,
++        )
++
++    routing_text = _strip_readonly_guard_phrases(normalized)
++    safety_risk = _safety_risk(routing_text)
++    has_dependencies = _has_any(routing_text, _DEPENDENCY_PATTERNS)
++    simple = _has_any(routing_text, _SIMPLE_PATTERNS)
++    write_heavy = _write_heavy(routing_text)
++    explicit_delegation = _has_any(normalized, _EXPLICIT_DELEGATION_PATTERNS)
++    delegation_forbidden = _has_any(normalized, _FORBID_DELEGATION_PATTERNS)
++    parallel_signal = _has_any(normalized, _PARALLEL_PATTERNS) or explicit_delegation
++    read_only_signal = _has_any(normalized, _READONLY_PATTERNS) or explicit_delegation
++    homogeneous = _has_any(normalized, _HOMOGENEOUS_PATTERNS)
++
++    items = _candidate_items(raw)
++    estimated_subtasks = len(items) if items else (1 if normalized else 0)
++    requires_shared_context = bool(write_heavy or homogeneous or has_dependencies)
++    parallelizable_subtasks = (
++        estimated_subtasks
++        if parallel_signal and read_only_signal and not requires_shared_context and not safety_risk
++        else 0
++    )
++
++    if safety_risk:
++        reasons.append("safety_guard")
++        return _decision(
++            TaskRoute.SERIAL,
++            reasons,
++            estimated_subtasks=estimated_subtasks,
++            parallelizable_subtasks=0,
++            recommended_subagents=0,
++            requires_shared_context=requires_shared_context,
++            has_dependencies=has_dependencies,
++            safety_risk=True,
++        )
++
++    if has_dependencies:
++        reasons.append("dependent_steps")
++        return _decision(
++            TaskRoute.SERIAL,
++            reasons,
++            estimated_subtasks=estimated_subtasks,
++            parallelizable_subtasks=0,
++            recommended_subagents=0,
++            requires_shared_context=True,
++            has_dependencies=True,
++            safety_risk=False,
++        )
++
++    if simple and estimated_subtasks <= 1:
++        reasons.append("simple")
++        return _decision(
++            TaskRoute.SERIAL,
++            reasons,
++            estimated_subtasks=1,
++            parallelizable_subtasks=0,
++            recommended_subagents=0,
++            requires_shared_context=False,
++            has_dependencies=False,
++            safety_risk=False,
++        )
++
++    if delegation_forbidden:
++        reasons.append("delegation_forbidden_by_user")
++        route = TaskRoute.BATCHED_SINGLE_AGENT if estimated_subtasks > 1 else TaskRoute.SERIAL
++        return _decision(
++            route,
++            reasons,
++            estimated_subtasks=estimated_subtasks,
++            parallelizable_subtasks=0,
++            recommended_subagents=0,
++            requires_shared_context=requires_shared_context,
++            has_dependencies=False,
++            safety_risk=False,
++        )
++
++    if not cfg.enable_parallel_subagents:
++        reasons.append("parallel_disabled")
++        route = TaskRoute.BATCHED_SINGLE_AGENT if estimated_subtasks > 1 else TaskRoute.SERIAL
++        if estimated_subtasks <= 1:
++            reasons.append("ambiguous")
++        return _decision(
++            route,
++            reasons,
++            estimated_subtasks=estimated_subtasks,
++            parallelizable_subtasks=0,
++            recommended_subagents=0,
++            requires_shared_context=requires_shared_context,
++            has_dependencies=False,
++            safety_risk=False,
++        )
++
++    min_parallel = 2 if explicit_delegation else max(2, int(cfg.min_parallel_subtasks))
++    max_parallel = max(0, int(cfg.max_parallel_subagents))
++    if parallel_signal and read_only_signal and not requires_shared_context:
++        if parallelizable_subtasks >= min_parallel and max_parallel >= 2:
++            recommended = min(parallelizable_subtasks, max_parallel)
++            reasons.append("independent_workstreams")
++            if parallelizable_subtasks > recommended:
++                reasons.append("capped_parallelism")
++            subtasks = tuple(_make_subtasks(items[:recommended]))
++            return TaskRouteDecision(
++                route=TaskRoute.PARALLEL_SUBAGENTS,
++                reasons=tuple(reasons),
++                metrics={
++                    "estimated_subtasks": estimated_subtasks,
++                    "parallelizable_subtasks": parallelizable_subtasks,
++                    "recommended_subagents": recommended,
++                    "requires_shared_context": False,
++                    "has_dependencies": False,
++                    "safety_risk": False,
++                },
++                subtasks=subtasks,
++            )
++        reasons.append("below_parallel_threshold")
++
++    if estimated_subtasks > 1:
++        if homogeneous:
++            reasons.append("homogeneous_batch")
++        elif write_heavy:
++            reasons.append("small_related_batch")
++        else:
++            reasons.append("multiple_items")
++        return _decision(
++            TaskRoute.BATCHED_SINGLE_AGENT,
++            reasons,
++            estimated_subtasks=estimated_subtasks,
++            parallelizable_subtasks=parallelizable_subtasks,
++            recommended_subagents=0,
++            requires_shared_context=requires_shared_context or homogeneous,
++            has_dependencies=False,
++            safety_risk=False,
++        )
++
++    reasons.append("ambiguous")
++    return _decision(
++        TaskRoute.SERIAL,
++        reasons,
++        estimated_subtasks=1,
++        parallelizable_subtasks=0,
++        recommended_subagents=0,
++        requires_shared_context=requires_shared_context,
++        has_dependencies=False,
++        safety_risk=False,
++    )
++
++
++def to_delegate_tasks(decision: TaskRouteDecision) -> list[dict[str, Any]]:
++    """Convert a parallel decision into a delegate_task-compatible tasks array."""
++
++    if decision.route is not TaskRoute.PARALLEL_SUBAGENTS:
++        return []
++    return [subtask.to_dict() for subtask in decision.subtasks]
++
++
++def _decision(
++    route: TaskRoute,
++    reasons: list[str],
++    *,
++    estimated_subtasks: int,
++    parallelizable_subtasks: int,
++    recommended_subagents: int,
++    requires_shared_context: bool,
++    has_dependencies: bool,
++    safety_risk: bool,
++) -> TaskRouteDecision:
++    return TaskRouteDecision(
++        route=route,
++        reasons=tuple(reasons),
++        metrics={
++            "estimated_subtasks": int(estimated_subtasks),
++            "parallelizable_subtasks": int(parallelizable_subtasks),
++            "recommended_subagents": int(recommended_subagents),
++            "requires_shared_context": bool(requires_shared_context),
++            "has_dependencies": bool(has_dependencies),
++            "safety_risk": bool(safety_risk),
++        },
++    )
++
++
++def _normalize(text: str) -> str:
++    return " ".join((text or "").lower().split())
++
++
++def _strip_readonly_guard_phrases(text: str) -> str:
++    """Remove negated write clauses that mean "read-only", not "write-heavy".
++
++    Examples: "Do not modify files", "No file changes", and
++    "without editing" should not make an otherwise read-only review look like a
++    shared-context mutation task. Positive write requests still remain intact.
++    """
++
++    previous = text or ""
++    while True:
++        stripped = _READONLY_GUARD_CLAUSE_RE.sub(" ", previous)
++        stripped = re.sub(
++            r"\s+without\s+(?:modifying|editing|updating|changing|writing|applying|creating|rewriting|refactoring)(?:\s+(?:files?|changes?))?\.?\s*$",
++            " ",
++            stripped,
++            flags=re.IGNORECASE,
++        )
++        stripped = re.sub(
++            r"^\s*read[- ]only\s+(?=(?:review|audit|analysis|analy[sz]e|inspect|check|compare|evaluate|triage)\b)",
++            "",
++            stripped,
++            flags=re.IGNORECASE,
++        )
++        stripped = " ".join(stripped.split())
++        if stripped == previous:
++            return stripped
++        previous = stripped
++
++
++def _has_any(text: str, patterns: Iterable[str]) -> bool:
++    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
++
++
++def _safety_risk(text: str) -> bool:
++    if not _has_any(text, _SAFETY_PATTERNS):
++        return False
++    if re.search(r"\b(delete\s+command\s+behavior|rm\s+safety)\b", text):
++        return False
++    if re.search(r"\b(database\s+migration\s+guide|migration\s+docs?|deployment\s+checklist|rollback\s+docs?)\b", text):
++        return False
++    return True
++
++
++def _write_heavy(text: str) -> bool:
++    if not _has_any(text, _WRITE_PATTERNS):
++        return False
++    # Noun phrases such as "after the refactor" should not turn read-only audits into shared-context writes.
++    if re.search(r"\bafter\s+the\s+refactor\b", text):
++        without_temporal = re.sub(r"\bafter\s+the\s+refactor\b", "", text)
++        return _has_any(without_temporal, _WRITE_PATTERNS)
++    return True
++
++
++def _candidate_items(task: str) -> list[str]:
++    """Extract coarse independent item candidates while preserving order."""
++
++    stripped = (task or "").strip()
++    if not stripped:
++        return []
++
++    bullet_items: list[str] = []
++    for line in stripped.splitlines():
++        match = re.match(r"^\s*(?:[-*]|\d+[.)])\s+(.+?)\s*$", line)
++        if match:
++            bullet_items.append(_clean_item(match.group(1)))
++    if len(bullet_items) > 1:
++        return [item for item in bullet_items if item]
++
++    lowered = _strip_readonly_guard_phrases(stripped.lower())
++    # Remove common framing verbs so comma/and splitting yields item names.
++    lowered = re.sub(
++        r"^\s*(?:use\s+(?:\w+\s+)?(?:parallel\s+)?subagents?\s+to|spawn\s+(?:parallel\s+)?subagents?\s+for|please\s+delegate|delegate|research|investigate|analyze|analyse|audit|review|compare|inspect|check|triage)\s+",
++        "",
++        lowered,
++    )
++    lowered = re.sub(r"\s+independently\.?$", "", lowered)
++    lowered = re.sub(r"\s+and\s+compare(?:\s+their\s+tradeoffs)?\.?$", "", lowered)
++    lowered = re.sub(r"\s+their\s+tradeoffs\.?$", "", lowered)
++
++    if ";" in lowered:
++        parts = [_clean_item(part) for part in lowered.split(";")]
++        return [part for part in parts if part]
++
++    # Split comma lists and final "and". Avoid treating plain two-word phrases
++    # as multiple tasks unless there is a comma or clear list structure.
++    if "," in lowered:
++        lowered = re.sub(r",?\s+and\s+", ", ", lowered)
++        parts = [_clean_item(part) for part in lowered.split(",")]
++        return [part for part in parts if part]
++
++    # For no-comma multi-item patterns, split only when the sentence contains a
++    # strong workstream signal and a small number of "and" separators.
++    if re.search(r"\b(independently|compare|research|investigate|analyze|analyse|audit|review)\b", stripped, re.I):
++        parts = [_clean_item(part) for part in re.split(r"\s+and\s+", lowered)]
++        if len(parts) > 1:
++            return [part for part in parts if part]
++
++    return []
++
++
++def _clean_item(item: str) -> str:
++    item = re.sub(r"\s+", " ", item.strip(" .:-"))
++    item = re.sub(r"^(?:the|a|an)\s+", "", item)
++    return item
++
++
++def _make_subtasks(items: list[str]) -> list[RoutedSubtask]:
++    subtasks: list[RoutedSubtask] = []
++    for item in items:
++        goal = item.strip()
++        if not goal:
++            continue
++        subtasks.append(
++            RoutedSubtask(
++                goal=f"Investigate {goal}",
++                context="Return concise findings, evidence, risks, and recommended next action.",
++            )
++        )
++    return subtasks
+diff --git a/agent/task_router_eval.py b/agent/task_router_eval.py
+new file mode 100644
+index 000000000..f9ed8cc9f
+--- /dev/null
++++ b/agent/task_router_eval.py
+@@ -0,0 +1,603 @@
++"""Deterministic evaluation helpers for Hermes task routing.
++
++This module is intentionally offline and side-effect free except for the explicit
++``load_eval_cases`` helper.  It gives future router changes a small measurable
++regression surface before any runtime delegation integration changes behavior.
++"""
++
++from __future__ import annotations
++
++import json
++from collections import Counter, defaultdict
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any, Callable, Iterable, Mapping
++
++from agent.task_router import TaskRoute, TaskRouteDecision, TaskRouterConfig, route_task
++
++
++_UNSAFE_TAGS = frozenset({"safety", "destructive", "dependent", "write_heavy", "secrets"})
++_METRIC_KEYS = frozenset(
++    {
++        "estimated_subtasks",
++        "parallelizable_subtasks",
++        "recommended_subagents",
++        "requires_shared_context",
++        "has_dependencies",
++        "safety_risk",
++    }
++)
++_CONFIG_KEYS = frozenset({"enable_parallel_subagents", "min_parallel_subtasks", "max_parallel_subagents"})
++
++
++@dataclass(frozen=True)
++class TaskRouterEvalCase:
++    """A golden routing case for deterministic router evaluation."""
++
++    id: str
++    task: str
++    expected_route: TaskRoute
++    tags: tuple[str, ...] = ()
++    required_reasons: tuple[str, ...] = ()
++    forbidden_reasons: tuple[str, ...] = ()
++    forbidden_routes: tuple[TaskRoute, ...] = ()
++    expected_metrics: Mapping[str, int | bool] = field(default_factory=dict)
++    config: TaskRouterConfig | None = None
++    min_recommended_subagents: int | None = None
++    max_recommended_subagents: int | None = None
++
++    @classmethod
++    def from_dict(cls, payload: Mapping[str, Any]) -> "TaskRouterEvalCase":
++        try:
++            case_id = str(payload["id"])
++            task = str(payload["task"])
++            expected_route = TaskRoute(str(payload["expected_route"]))
++        except KeyError as exc:  # pragma: no cover - exercised via ValueError path
++            raise ValueError(f"missing required eval case field: {exc.args[0]}") from exc
++        except ValueError as exc:
++            raise ValueError(
++                f"invalid expected_route for eval case {payload.get('id', '<unknown>')!r}: "
++                f"{payload.get('expected_route')!r}"
++            ) from exc
++
++        min_recommended = _optional_int(payload.get("min_recommended_subagents"))
++        max_recommended = _optional_int(payload.get("max_recommended_subagents"))
++        if min_recommended is not None and min_recommended < 0:
++            raise ValueError("min_recommended_subagents must be >= 0")
++        if max_recommended is not None and max_recommended < 0:
++            raise ValueError("max_recommended_subagents must be >= 0")
++        if (
++            min_recommended is not None
++            and max_recommended is not None
++            and min_recommended > max_recommended
++        ):
++            raise ValueError("min_recommended_subagents cannot exceed max_recommended_subagents")
++
++        return cls(
++            id=case_id,
++            task=task,
++            expected_route=expected_route,
++            tags=tuple(str(tag) for tag in payload.get("tags", ())),
++            required_reasons=tuple(
++                str(reason) for reason in payload.get("required_reasons", ())
++            ),
++            forbidden_reasons=tuple(
++                str(reason) for reason in payload.get("forbidden_reasons", ())
++            ),
++            forbidden_routes=_coerce_forbidden_routes(payload.get("forbidden_routes", ())),
++            min_recommended_subagents=min_recommended,
++            max_recommended_subagents=max_recommended,
++            expected_metrics=_coerce_expected_metrics(payload.get("expected_metrics", {})),
++            config=_coerce_config(payload.get("config")),
++        )
++
++    def to_dict(self) -> dict[str, Any]:
++        payload: dict[str, Any] = {
++            "id": self.id,
++            "task": self.task,
++            "expected_route": self.expected_route.value,
++            "tags": list(self.tags),
++            "required_reasons": list(self.required_reasons),
++            "forbidden_reasons": list(self.forbidden_reasons),
++            "forbidden_routes": [route.value for route in self.forbidden_routes],
++        }
++        if self.min_recommended_subagents is not None:
++            payload["min_recommended_subagents"] = self.min_recommended_subagents
++        if self.max_recommended_subagents is not None:
++            payload["max_recommended_subagents"] = self.max_recommended_subagents
++        if self.expected_metrics:
++            payload["expected_metrics"] = dict(self.expected_metrics)
++        if self.config:
++            payload["config"] = {
++                "enable_parallel_subagents": self.config.enable_parallel_subagents,
++                "min_parallel_subtasks": self.config.min_parallel_subtasks,
++                "max_parallel_subagents": self.config.max_parallel_subagents,
++            }
++        return payload
++
++
++@dataclass(frozen=True)
++class TaskRouterCaseResult:
++    """Evaluation result for a single golden case."""
++
++    case: TaskRouterEvalCase
++    decision: TaskRouteDecision
++    passed: bool
++    failures: tuple[str, ...] = ()
++
++    def to_dict(self) -> dict[str, Any]:
++        return {
++            "case": self.case.to_dict(),
++            "decision": self.decision.to_dict(),
++            "passed": self.passed,
++            "failures": list(self.failures),
++        }
++
++
++@dataclass(frozen=True)
++class TaskRouterEvalSummary:
++    """Aggregate deterministic metrics for a router evaluation corpus."""
++
++    total: int
++    passed: int
++    failed: int
++    accuracy: float
++    over_delegate_count: int
++    under_delegate_count: int
++    unsafe_delegate_count: int
++    route_confusion: Mapping[str, Mapping[str, int]]
++    reason_counts: Mapping[str, int]
++    average_recommended_subagents: float
++    expected_parallel_count: int
++    actual_parallel_count: int
++    parallel_true_positive_count: int
++    parallel_precision: float
++    parallel_recall: float
++    parallel_f1: float
++    total_recommended_subagents: int
++    tag_counts: Mapping[str, int]
++    tag_failures: Mapping[str, int]
++    tag_accuracy: Mapping[str, float]
++    results: tuple[TaskRouterCaseResult, ...] = field(default_factory=tuple)
++
++    def to_dict(self) -> dict[str, Any]:
++        return {
++            "total": self.total,
++            "passed": self.passed,
++            "failed": self.failed,
++            "accuracy": self.accuracy,
++            "over_delegate_count": self.over_delegate_count,
++            "under_delegate_count": self.under_delegate_count,
++            "unsafe_delegate_count": self.unsafe_delegate_count,
++            "route_confusion": {
++                expected: dict(actual)
++                for expected, actual in self.route_confusion.items()
++            },
++            "reason_counts": dict(self.reason_counts),
++            "average_recommended_subagents": self.average_recommended_subagents,
++            "expected_parallel_count": self.expected_parallel_count,
++            "actual_parallel_count": self.actual_parallel_count,
++            "parallel_true_positive_count": self.parallel_true_positive_count,
++            "parallel_precision": self.parallel_precision,
++            "parallel_recall": self.parallel_recall,
++            "parallel_f1": self.parallel_f1,
++            "total_recommended_subagents": self.total_recommended_subagents,
++            "tag_counts": dict(self.tag_counts),
++            "tag_failures": dict(self.tag_failures),
++            "tag_accuracy": dict(self.tag_accuracy),
++            "results": [result.to_dict() for result in self.results],
++        }
++
++
++@dataclass(frozen=True)
++class TaskRouterBenchmarkVariant:
++    """A named router configuration variant for offline benchmarking."""
++
++    name: str
++    config: TaskRouterConfig
++
++
++@dataclass(frozen=True)
++class TaskRouterBenchmarkDelta:
++    """Metric delta for a benchmark variant relative to a baseline variant."""
++
++    variant: str
++    baseline_variant: str
++    accuracy_delta: float
++    over_delegate_delta: int
++    under_delegate_delta: int
++    unsafe_delegate_delta: int
++    parallel_precision_delta: float
++    parallel_recall_delta: float
++    parallel_f1_delta: float
++    total_recommended_subagents_delta: int
++    average_recommended_subagents_delta: float
++
++    def to_dict(self) -> dict[str, Any]:
++        return {
++            "variant": self.variant,
++            "baseline_variant": self.baseline_variant,
++            "accuracy_delta": self.accuracy_delta,
++            "over_delegate_delta": self.over_delegate_delta,
++            "under_delegate_delta": self.under_delegate_delta,
++            "unsafe_delegate_delta": self.unsafe_delegate_delta,
++            "parallel_precision_delta": self.parallel_precision_delta,
++            "parallel_recall_delta": self.parallel_recall_delta,
++            "parallel_f1_delta": self.parallel_f1_delta,
++            "total_recommended_subagents_delta": self.total_recommended_subagents_delta,
++            "average_recommended_subagents_delta": self.average_recommended_subagents_delta,
++        }
++
++
++@dataclass(frozen=True)
++class TaskRouterBenchmarkSummary:
++    """Comparative benchmark summary for multiple router configs."""
++
++    baseline_variant: str
++    variants: Mapping[str, TaskRouterEvalSummary]
++    deltas: Mapping[str, TaskRouterBenchmarkDelta]
++    best_by_parallel_f1: str
++    best_safe_variant: str | None
++
++    def to_dict(self) -> dict[str, Any]:
++        return {
++            "baseline_variant": self.baseline_variant,
++            "variants": {
++                name: self.variants[name].to_dict()
++                for name in sorted(self.variants)
++            },
++            "deltas": {
++                name: self.deltas[name].to_dict()
++                for name in sorted(self.deltas)
++            },
++            "best_by_parallel_f1": self.best_by_parallel_f1,
++            "best_safe_variant": self.best_safe_variant,
++        }
++
++
++RouterFn = Callable[..., TaskRouteDecision]
++
++
++def load_eval_cases(path: str | Path) -> list[TaskRouterEvalCase]:
++    """Load newline-delimited JSON eval cases with basic validation."""
++
++    cases: list[TaskRouterEvalCase] = []
++    case_ids: set[str] = set()
++    case_path = Path(path)
++    for line_number, raw_line in enumerate(case_path.read_text().splitlines(), start=1):
++        line = raw_line.strip()
++        if not line or line.startswith("#"):
++            continue
++        try:
++            payload = json.loads(line)
++            case = TaskRouterEvalCase.from_dict(payload)
++        except Exception as exc:  # noqa: BLE001 - include line number for fixture debugging
++            raise ValueError(f"invalid task router eval case at {case_path}:{line_number}") from exc
++        if case.id in case_ids:
++            raise ValueError(f"duplicate task router eval case id: {case.id}")
++        case_ids.add(case.id)
++        cases.append(case)
++    return cases
++
++
++def evaluate_task_router(
++    cases: Iterable[TaskRouterEvalCase],
++    *,
++    config: TaskRouterConfig | None = None,
++    router: RouterFn = route_task,
++) -> TaskRouterEvalSummary:
++    """Evaluate a ``route_task``-style callable against deterministic cases."""
++
++    results: list[TaskRouterCaseResult] = []
++    confusion: dict[str, Counter[str]] = defaultdict(Counter)
++    reason_counts: Counter[str] = Counter()
++    over_delegate_count = 0
++    under_delegate_count = 0
++    unsafe_delegate_count = 0
++    recommended_total = 0
++    expected_parallel_count = 0
++    actual_parallel_count = 0
++    parallel_true_positive_count = 0
++    tag_counts: Counter[str] = Counter()
++    tag_failures: Counter[str] = Counter()
++
++    for case in cases:
++        case_config = _case_config(config, case.config)
++        decision = router(case.task, config=case_config)
++        failures = _case_failures(case, decision)
++        result = TaskRouterCaseResult(
++            case=case,
++            decision=decision,
++            passed=not failures,
++            failures=tuple(failures),
++        )
++        results.append(result)
++
++        expected = case.expected_route.value
++        actual = decision.route.value
++        confusion[expected][actual] += 1
++        reason_counts.update(decision.reasons)
++        recommended = int(decision.metrics.get("recommended_subagents", 0))
++        recommended_total += recommended
++        expected_parallel = case.expected_route is TaskRoute.PARALLEL_SUBAGENTS
++        actual_parallel = decision.route is TaskRoute.PARALLEL_SUBAGENTS
++        expected_parallel_count += int(expected_parallel)
++        actual_parallel_count += int(actual_parallel)
++        parallel_true_positive_count += int(expected_parallel and actual_parallel)
++        tag_counts.update(case.tags)
++        if failures:
++            tag_failures.update(case.tags)
++
++        if decision.route is TaskRoute.PARALLEL_SUBAGENTS:
++            if case.expected_route is not TaskRoute.PARALLEL_SUBAGENTS:
++                over_delegate_count += 1
++            if _UNSAFE_TAGS.intersection(case.tags):
++                unsafe_delegate_count += 1
++        elif case.expected_route is TaskRoute.PARALLEL_SUBAGENTS:
++            under_delegate_count += 1
++
++    total = len(results)
++    passed = sum(1 for result in results if result.passed)
++    failed = total - passed
++    parallel_precision = (
++        parallel_true_positive_count / actual_parallel_count
++        if actual_parallel_count
++        else (1.0 if expected_parallel_count == 0 else 0.0)
++    )
++    parallel_recall = (
++        parallel_true_positive_count / expected_parallel_count
++        if expected_parallel_count
++        else 1.0
++    )
++    parallel_f1 = (
++        2 * parallel_precision * parallel_recall / (parallel_precision + parallel_recall)
++        if (parallel_precision + parallel_recall)
++        else 0.0
++    )
++    tag_accuracy = {
++        tag: ((tag_counts[tag] - tag_failures.get(tag, 0)) / tag_counts[tag])
++        for tag in sorted(tag_counts)
++    }
++    return TaskRouterEvalSummary(
++        total=total,
++        passed=passed,
++        failed=failed,
++        accuracy=(passed / total) if total else 1.0,
++        over_delegate_count=over_delegate_count,
++        under_delegate_count=under_delegate_count,
++        unsafe_delegate_count=unsafe_delegate_count,
++        route_confusion=_complete_confusion(confusion),
++        reason_counts=dict(sorted(reason_counts.items())),
++        average_recommended_subagents=(recommended_total / total) if total else 0.0,
++        expected_parallel_count=expected_parallel_count,
++        actual_parallel_count=actual_parallel_count,
++        parallel_true_positive_count=parallel_true_positive_count,
++        parallel_precision=parallel_precision,
++        parallel_recall=parallel_recall,
++        parallel_f1=parallel_f1,
++        total_recommended_subagents=recommended_total,
++        tag_counts=dict(sorted(tag_counts.items())),
++        tag_failures=dict(sorted(tag_failures.items())),
++        tag_accuracy=tag_accuracy,
++        results=tuple(results),
++    )
++
++
++def benchmark_task_router_configs(
++    cases: Iterable[TaskRouterEvalCase],
++    variants: Iterable[TaskRouterBenchmarkVariant],
++    *,
++    baseline_variant: str = "default",
++    router: RouterFn = route_task,
++    include_case_config_cases: bool = False,
++) -> TaskRouterBenchmarkSummary:
++    """Evaluate the same corpus across named router configuration variants.
++
++    By default, cases with per-case router config overrides are excluded so a
++    variant name like ``disabled`` or ``cap_2`` means the variant config is
++    applied uniformly to every benchmarked case. Use ``evaluate_task_router``
++    for exact golden-corpus validation of per-case config behavior.
++    """
++
++    case_list = list(cases)
++    if not include_case_config_cases:
++        case_list = [case for case in case_list if case.config is None]
++    if not case_list:
++        raise ValueError("benchmark corpus is empty")
++
++    variant_list = list(variants)
++    if not variant_list:
++        raise ValueError("at least one benchmark variant is required")
++
++    summaries: dict[str, TaskRouterEvalSummary] = {}
++    for variant in variant_list:
++        name = variant.name.strip()
++        if not name:
++            raise ValueError("benchmark variant name must not be empty")
++        if name in summaries:
++            raise ValueError(f"duplicate benchmark variant: {name}")
++        summaries[name] = evaluate_task_router(case_list, config=variant.config, router=router)
++
++    if baseline_variant not in summaries:
++        raise ValueError(f"baseline variant not found: {baseline_variant}")
++
++    baseline = summaries[baseline_variant]
++    deltas = {
++        name: _benchmark_delta(name, baseline_variant, summary, baseline)
++        for name, summary in summaries.items()
++    }
++    best_by_parallel_f1 = min(summaries, key=lambda name: _benchmark_rank_key(name, summaries[name]))
++    safe_candidates = [
++        name
++        for name, summary in summaries.items()
++        if summary.unsafe_delegate_count == 0
++        and summary.over_delegate_count == 0
++        and summary.accuracy >= baseline.accuracy
++    ]
++    best_safe_variant = (
++        min(safe_candidates, key=lambda name: _benchmark_rank_key(name, summaries[name]))
++        if safe_candidates
++        else None
++    )
++
++    return TaskRouterBenchmarkSummary(
++        baseline_variant=baseline_variant,
++        variants=dict(sorted(summaries.items())),
++        deltas=dict(sorted(deltas.items())),
++        best_by_parallel_f1=best_by_parallel_f1,
++        best_safe_variant=best_safe_variant,
++    )
++
++
++def _benchmark_delta(
++    variant: str,
++    baseline_variant: str,
++    summary: TaskRouterEvalSummary,
++    baseline: TaskRouterEvalSummary,
++) -> TaskRouterBenchmarkDelta:
++    return TaskRouterBenchmarkDelta(
++        variant=variant,
++        baseline_variant=baseline_variant,
++        accuracy_delta=summary.accuracy - baseline.accuracy,
++        over_delegate_delta=summary.over_delegate_count - baseline.over_delegate_count,
++        under_delegate_delta=summary.under_delegate_count - baseline.under_delegate_count,
++        unsafe_delegate_delta=summary.unsafe_delegate_count - baseline.unsafe_delegate_count,
++        parallel_precision_delta=summary.parallel_precision - baseline.parallel_precision,
++        parallel_recall_delta=summary.parallel_recall - baseline.parallel_recall,
++        parallel_f1_delta=summary.parallel_f1 - baseline.parallel_f1,
++        total_recommended_subagents_delta=(
++            summary.total_recommended_subagents - baseline.total_recommended_subagents
++        ),
++        average_recommended_subagents_delta=(
++            summary.average_recommended_subagents - baseline.average_recommended_subagents
++        ),
++    )
++
++
++def _benchmark_rank_key(name: str, summary: TaskRouterEvalSummary) -> tuple[float, int, int, float, int, str]:
++    return (
++        -summary.parallel_f1,
++        summary.unsafe_delegate_count,
++        summary.over_delegate_count,
++        -summary.accuracy,
++        summary.total_recommended_subagents,
++        name,
++    )
++
++
++def _case_failures(
++    case: TaskRouterEvalCase,
++    decision: TaskRouteDecision,
++) -> list[str]:
++    failures: list[str] = []
++    if decision.route is not case.expected_route:
++        failures.append(
++            f"route expected {case.expected_route.value}, got {decision.route.value}"
++        )
++    if decision.route in case.forbidden_routes:
++        failures.append(f"forbidden route selected: {decision.route.value}")
++
++    reasons = set(decision.reasons)
++    for reason in case.required_reasons:
++        if reason not in reasons:
++            failures.append(f"missing required reason: {reason}")
++    for reason in case.forbidden_reasons:
++        if reason in reasons:
++            failures.append(f"forbidden reason present: {reason}")
++
++    for key, expected_value in case.expected_metrics.items():
++        actual_value = decision.metrics.get(key)
++        if actual_value != expected_value:
++            failures.append(
++                f"metric {key} expected {expected_value!r}, got {actual_value!r}"
++            )
++
++    recommended = int(decision.metrics.get("recommended_subagents", 0))
++    if (
++        case.min_recommended_subagents is not None
++        and recommended < case.min_recommended_subagents
++    ):
++        failures.append(
++            "recommended_subagents below minimum: "
++            f"{recommended} < {case.min_recommended_subagents}"
++        )
++    if (
++        case.max_recommended_subagents is not None
++        and recommended > case.max_recommended_subagents
++    ):
++        failures.append(
++            "recommended_subagents above maximum: "
++            f"{recommended} > {case.max_recommended_subagents}"
++        )
++    return failures
++
++
++def _complete_confusion(
++    confusion: Mapping[str, Counter[str]],
++) -> dict[str, dict[str, int]]:
++    routes = [route.value for route in TaskRoute]
++    return {
++        expected: {actual: int(confusion.get(expected, {}).get(actual, 0)) for actual in routes}
++        for expected in routes
++    }
++
++
++def _optional_int(value: Any) -> int | None:
++    if value is None:
++        return None
++    return int(value)
++
++
++def _coerce_expected_metrics(value: Any) -> dict[str, int | bool]:
++    if not value:
++        return {}
++    if not isinstance(value, Mapping):
++        raise ValueError("expected_metrics must be an object")
++    metrics: dict[str, int | bool] = {}
++    for key, metric_value in value.items():
++        metric_key = str(key)
++        if metric_key not in _METRIC_KEYS:
++            raise ValueError(f"unknown expected metric key: {metric_key}")
++        if isinstance(metric_value, bool):
++            metrics[metric_key] = metric_value
++        elif isinstance(metric_value, int):
++            metrics[metric_key] = metric_value
++        else:
++            raise ValueError(
++                f"expected metric {key!r} must be an int or bool, got {type(metric_value).__name__}"
++            )
++    return metrics
++
++
++def _coerce_forbidden_routes(value: Any) -> tuple[TaskRoute, ...]:
++    if not value:
++        return ()
++    if not isinstance(value, Iterable) or isinstance(value, (str, bytes)):
++        raise ValueError("forbidden_routes must be a list")
++    routes: list[TaskRoute] = []
++    for route_value in value:
++        try:
++            routes.append(TaskRoute(str(route_value)))
++        except ValueError as exc:
++            raise ValueError(f"invalid forbidden route: {route_value!r}") from exc
++    return tuple(routes)
++
++
++def _coerce_config(value: Any) -> TaskRouterConfig | None:
++    if not value:
++        return None
++    if not isinstance(value, Mapping):
++        raise ValueError("config must be an object")
++    unknown = set(str(key) for key in value) - _CONFIG_KEYS
++    if unknown:
++        raise ValueError(f"unknown config key(s): {', '.join(sorted(unknown))}")
++    return TaskRouterConfig(**dict(value))
++
++
++def _case_config(
++    global_config: TaskRouterConfig | None,
++    case_config: TaskRouterConfig | None,
++) -> TaskRouterConfig | None:
++    if case_config is None:
++        return global_config
++    return case_config
+diff --git a/scripts/benchmark_task_router_configs.py b/scripts/benchmark_task_router_configs.py
+new file mode 100644
+index 000000000..a7d81352e
+--- /dev/null
++++ b/scripts/benchmark_task_router_configs.py
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python3
++"""Benchmark deterministic task-router config variants against one corpus."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++if str(REPO_ROOT) not in sys.path:
++    sys.path.insert(0, str(REPO_ROOT))
++
++from agent.task_router import TaskRouterConfig  # noqa: E402
++from agent.task_router_eval import (  # noqa: E402
++    TaskRouterBenchmarkSummary,
++    TaskRouterBenchmarkVariant,
++    benchmark_task_router_configs,
++    load_eval_cases,
++)
++
++DEFAULT_CASES = REPO_ROOT / "tests" / "fixtures" / "task_router_eval_cases.jsonl"
++
++DEFAULT_VARIANTS = (
++    TaskRouterBenchmarkVariant("default", TaskRouterConfig()),
++    TaskRouterBenchmarkVariant(
++        "disabled",
++        TaskRouterConfig(enable_parallel_subagents=False),
++    ),
++    TaskRouterBenchmarkVariant("threshold_2", TaskRouterConfig(min_parallel_subtasks=2)),
++    TaskRouterBenchmarkVariant("threshold_4", TaskRouterConfig(min_parallel_subtasks=4)),
++    TaskRouterBenchmarkVariant("cap_2", TaskRouterConfig(max_parallel_subagents=2)),
++    TaskRouterBenchmarkVariant("cap_3", TaskRouterConfig(max_parallel_subagents=3)),
++)
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--cases", default=str(DEFAULT_CASES), help="JSONL eval cases")
++    parser.add_argument("--json", action="store_true", help="emit full JSON summary")
++    parser.add_argument(
++        "--baseline-variant",
++        default="default",
++        help="variant name used for delta and gate comparisons",
++    )
++    parser.add_argument(
++        "--min-baseline-accuracy",
++        type=float,
++        default=1.0,
++        help="minimum acceptable baseline exact-case accuracy",
++    )
++    parser.add_argument(
++        "--max-baseline-over-delegate",
++        type=int,
++        default=0,
++        help="maximum baseline non-parallel cases routed to parallel subagents",
++    )
++    parser.add_argument(
++        "--max-baseline-under-delegate",
++        type=int,
++        default=0,
++        help="maximum baseline parallel cases routed below parallel subagents",
++    )
++    parser.add_argument(
++        "--max-baseline-unsafe-delegate",
++        type=int,
++        default=0,
++        help="maximum baseline unsafe/destructive cases routed to parallel subagents",
++    )
++    args = parser.parse_args(argv)
++
++    try:
++        cases = load_eval_cases(args.cases)
++        summary = benchmark_task_router_configs(
++            cases,
++            DEFAULT_VARIANTS,
++            baseline_variant=args.baseline_variant,
++        )
++    except ValueError as exc:
++        print(f"task_router_benchmark: {exc}", file=sys.stderr)
++        return 2
++
++    if args.json:
++        print(json.dumps(summary.to_dict(), indent=2, sort_keys=True))
++    else:
++        _print_human_summary(summary)
++
++    baseline = summary.variants[summary.baseline_variant]
++    ok = (
++        baseline.accuracy >= args.min_baseline_accuracy
++        and baseline.over_delegate_count <= args.max_baseline_over_delegate
++        and baseline.under_delegate_count <= args.max_baseline_under_delegate
++        and baseline.unsafe_delegate_count <= args.max_baseline_unsafe_delegate
++    )
++    return 0 if ok else 1
++
++
++def _print_human_summary(summary: TaskRouterBenchmarkSummary) -> None:
++    first = next(iter(summary.variants.values()), None)
++    total = first.total if first else 0
++    print(
++        "task_router_benchmark: "
++        f"{len(summary.variants)} variants over {total} cases; "
++        f"baseline={summary.baseline_variant}"
++    )
++    print(
++        "variant        acc    over under unsafe precision recall f1    "
++        "avg_subagents total_subagents"
++    )
++    for name, variant_summary in summary.variants.items():
++        print(
++            f"{name:<14} "
++            f"{variant_summary.accuracy:.3f}  "
++            f"{variant_summary.over_delegate_count:<4} "
++            f"{variant_summary.under_delegate_count:<5} "
++            f"{variant_summary.unsafe_delegate_count:<6} "
++            f"{variant_summary.parallel_precision:.3f}     "
++            f"{variant_summary.parallel_recall:.3f}  "
++            f"{variant_summary.parallel_f1:.3f} "
++            f"{variant_summary.average_recommended_subagents:.2f}          "
++            f"{variant_summary.total_recommended_subagents}"
++        )
++    print(f"best_by_parallel_f1={summary.best_by_parallel_f1}")
++    print(f"best_safe_variant={summary.best_safe_variant}")
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/evaluate_task_router.py b/scripts/evaluate_task_router.py
+new file mode 100644
+index 000000000..d0b581e7e
+--- /dev/null
++++ b/scripts/evaluate_task_router.py
+@@ -0,0 +1,126 @@
++#!/usr/bin/env python3
++"""Run the deterministic task-router evaluation corpus."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++if str(REPO_ROOT) not in sys.path:
++    sys.path.insert(0, str(REPO_ROOT))
++
++from agent.task_router import TaskRouterConfig  # noqa: E402
++from agent.task_router_eval import evaluate_task_router, load_eval_cases  # noqa: E402
++
++DEFAULT_CASES = REPO_ROOT / "tests" / "fixtures" / "task_router_eval_cases.jsonl"
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--cases", default=str(DEFAULT_CASES), help="JSONL eval cases")
++    parser.add_argument("--json", action="store_true", help="emit full JSON summary")
++    parser.add_argument(
++        "--min-accuracy",
++        type=float,
++        default=1.0,
++        help="minimum acceptable exact-case accuracy",
++    )
++    parser.add_argument(
++        "--max-over-delegate",
++        type=int,
++        default=0,
++        help="maximum allowed non-parallel cases routed to parallel subagents",
++    )
++    parser.add_argument(
++        "--max-under-delegate",
++        type=int,
++        default=0,
++        help="maximum allowed parallel cases routed below parallel subagents",
++    )
++    parser.add_argument(
++        "--min-parallel-precision",
++        type=float,
++        default=1.0,
++        help="minimum precision for the parallel_subagents route",
++    )
++    parser.add_argument(
++        "--min-parallel-recall",
++        type=float,
++        default=1.0,
++        help="minimum recall for the parallel_subagents route",
++    )
++    parser.add_argument(
++        "--max-parallel-subagents",
++        type=int,
++        default=TaskRouterConfig.max_parallel_subagents,
++        help="router max_parallel_subagents for cases without per-case config",
++    )
++    parser.add_argument(
++        "--min-parallel-subtasks",
++        type=int,
++        default=TaskRouterConfig.min_parallel_subtasks,
++        help="router min_parallel_subtasks for cases without per-case config",
++    )
++    parser.add_argument(
++        "--disable-parallel-subagents",
++        action="store_true",
++        help="disable router parallel_subagents route for cases without per-case config",
++    )
++    args = parser.parse_args(argv)
++
++    cases = load_eval_cases(args.cases)
++    if not cases:
++        print("task_router_eval: no cases loaded", file=sys.stderr)
++        return 2
++    config = TaskRouterConfig(
++        enable_parallel_subagents=not args.disable_parallel_subagents,
++        min_parallel_subtasks=args.min_parallel_subtasks,
++        max_parallel_subagents=args.max_parallel_subagents,
++    )
++    summary = evaluate_task_router(cases, config=config)
++
++    if args.json:
++        print(json.dumps(summary.to_dict(), indent=2, sort_keys=True))
++    else:
++        print(
++            f"task_router_eval: {summary.passed}/{summary.total} passed; "
++            f"accuracy={summary.accuracy:.3f}"
++        )
++        print(
++            "delegation: "
++            f"over={summary.over_delegate_count} "
++            f"under={summary.under_delegate_count} "
++            f"unsafe={summary.unsafe_delegate_count} "
++            f"avg_subagents={summary.average_recommended_subagents:.2f} "
++            f"total_subagents={summary.total_recommended_subagents}"
++        )
++        print(
++            "parallel_quality: "
++            f"expected={summary.expected_parallel_count} "
++            f"actual={summary.actual_parallel_count} "
++            f"tp={summary.parallel_true_positive_count} "
++            f"precision={summary.parallel_precision:.3f} "
++            f"recall={summary.parallel_recall:.3f} "
++            f"f1={summary.parallel_f1:.3f}"
++        )
++        if summary.failed:
++            for result in summary.results:
++                if result.failures:
++                    print(f"FAIL {result.case.id}: {'; '.join(result.failures)}")
++
++    ok = (
++        summary.accuracy >= args.min_accuracy
++        and summary.unsafe_delegate_count == 0
++        and summary.over_delegate_count <= args.max_over_delegate
++        and summary.under_delegate_count <= args.max_under_delegate
++        and summary.parallel_precision >= args.min_parallel_precision
++        and summary.parallel_recall >= args.min_parallel_recall
++    )
++    return 0 if ok else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/agent/test_task_router.py b/tests/agent/test_task_router.py
+new file mode 100644
+index 000000000..6242c2d6b
+--- /dev/null
++++ b/tests/agent/test_task_router.py
+@@ -0,0 +1,205 @@
++"""Tests for the pure task router efficiency helper."""
++
++import json
++
++from agent.task_router import TaskRoute, TaskRouterConfig, route_task, to_delegate_tasks
++
++
++def test_empty_prompt_routes_serial():
++    decision = route_task("   ")
++
++    assert decision.route is TaskRoute.SERIAL
++    assert "empty_task" in decision.reasons
++    assert decision.metrics["estimated_subtasks"] == 0
++    assert decision.metrics["recommended_subagents"] == 0
++
++
++def test_simple_question_routes_serial():
++    decision = route_task("What is a Python virtualenv?")
++
++    assert decision.route is TaskRoute.SERIAL
++    assert "simple" in decision.reasons
++    assert decision.metrics["parallelizable_subtasks"] == 0
++
++
++def test_dependency_chain_blocks_parallel():
++    decision = route_task(
++        "First inspect the API, then based on that result update the caller."
++    )
++
++    assert decision.route is TaskRoute.SERIAL
++    assert "dependent_steps" in decision.reasons
++    assert decision.metrics["has_dependencies"] is True
++    assert decision.metrics["recommended_subagents"] == 0
++
++
++def test_destructive_task_routes_serial():
++    decision = route_task("Delete unused files and force push the cleaned branch.")
++
++    assert decision.route is TaskRoute.SERIAL
++    assert "safety_guard" in decision.reasons
++    assert decision.metrics["safety_risk"] is True
++    assert decision.metrics["recommended_subagents"] == 0
++
++
++def test_homogeneous_batch_routes_batched_single_agent():
++    decision = route_task(
++        "Apply the same formatting cleanup to README.md, docs/usage.md, and docs/config.md."
++    )
++
++    assert decision.route is TaskRoute.BATCHED_SINGLE_AGENT
++    assert "homogeneous_batch" in decision.reasons
++    assert decision.metrics["estimated_subtasks"] >= 3
++    assert decision.metrics["requires_shared_context"] is True
++
++
++def test_write_heavy_multi_step_not_parallel():
++    decision = route_task("Edit foo.py and update the tests and README.")
++
++    assert decision.route in {TaskRoute.SERIAL, TaskRoute.BATCHED_SINGLE_AGENT}
++    assert decision.route is not TaskRoute.PARALLEL_SUBAGENTS
++    assert decision.metrics["recommended_subagents"] == 0
++
++
++def test_independent_research_routes_parallel_with_subtasks():
++    decision = route_task(
++        "Investigate the CLI startup path, gateway batching, and tool sandbox independently."
++    )
++
++    assert decision.route is TaskRoute.PARALLEL_SUBAGENTS
++    assert "independent_workstreams" in decision.reasons
++    assert decision.metrics["parallelizable_subtasks"] >= 3
++    assert decision.metrics["recommended_subagents"] >= 2
++    assert len(decision.subtasks) == decision.metrics["recommended_subagents"]
++
++
++def test_parallelism_is_capped_by_config():
++    decision = route_task(
++        "Analyze auth, billing, notifications, search, indexing, telemetry, and permissions independently.",
++        config=TaskRouterConfig(max_parallel_subagents=3),
++    )
++
++    assert decision.route is TaskRoute.PARALLEL_SUBAGENTS
++    assert decision.metrics["recommended_subagents"] == 3
++    assert "capped_parallelism" in decision.reasons
++
++
++def test_parallel_disabled_forces_non_parallel():
++    decision = route_task(
++        "Investigate CLI, gateway, and memory independently.",
++        config=TaskRouterConfig(enable_parallel_subagents=False),
++    )
++
++    assert decision.route is not TaskRoute.PARALLEL_SUBAGENTS
++    assert "parallel_disabled" in decision.reasons
++    assert decision.metrics["recommended_subagents"] == 0
++
++
++def test_min_parallel_threshold_is_respected():
++    decision = route_task(
++        "Compare parser and renderer independently.",
++        config=TaskRouterConfig(min_parallel_subtasks=3),
++    )
++
++    assert decision.route is not TaskRoute.PARALLEL_SUBAGENTS
++    assert "below_parallel_threshold" in decision.reasons
++    assert decision.metrics["recommended_subagents"] == 0
++
++
++def test_to_delegate_tasks_only_for_parallel():
++    serial = route_task("What is Redis?")
++    assert to_delegate_tasks(serial) == []
++
++    parallel = route_task("Compare Redis, Postgres, and SQLite independently.")
++    tasks = to_delegate_tasks(parallel)
++    assert len(tasks) == parallel.metrics["recommended_subagents"]
++    assert all(set(task) >= {"goal", "context"} for task in tasks)
++
++
++def test_decision_payload_is_json_serializable():
++    decision = route_task("Investigate parser, cache, and retry logic independently.")
++    payload = decision.to_dict()
++
++    encoded = json.dumps(payload)
++    decoded = json.loads(encoded)
++
++    assert decoded["route"] == "parallel_subagents"
++    assert isinstance(decoded["metrics"]["estimated_subtasks"], int)
++
++
++
++def test_explicit_subagents_lower_safe_readonly_threshold():
++    decision = route_task("Use two subagents to compare Redis and SQLite independently.")
++
++    assert decision.route is TaskRoute.PARALLEL_SUBAGENTS
++    assert "independent_workstreams" in decision.reasons
++    assert decision.metrics["recommended_subagents"] == 2
++
++
++def test_user_can_forbid_subagents_even_with_independent_signal():
++    prompts = [
++        "Do not use subagents; review auth, billing, and search independently.",
++        "Please do not use any subagents; review auth, billing, and search independently.",
++        "Review auth, billing, and search independently without using subagents.",
++        "No parallel subagents please; review auth, billing, and search independently.",
++    ]
++
++    for prompt in prompts:
++        decision = route_task(prompt)
++        assert decision.route is TaskRoute.BATCHED_SINGLE_AGENT
++        assert "delegation_forbidden_by_user" in decision.reasons
++        assert "independent_workstreams" not in decision.reasons
++        assert decision.metrics["recommended_subagents"] == 0
++
++
++def test_secret_terms_block_parallel_delegation():
++    decision = route_task("Independently audit production API keys, database passwords, and OAuth tokens.")
++
++    assert decision.route is TaskRoute.SERIAL
++    assert "safety_guard" in decision.reasons
++    assert decision.metrics["safety_risk"] is True
++
++
++def test_readonly_qualifier_after_semicolon_is_not_fake_subtask():
++    decision = route_task("Analyze auth, billing, and search independently; do not write changes.")
++
++    assert decision.route is TaskRoute.PARALLEL_SUBAGENTS
++    assert decision.metrics["estimated_subtasks"] == 3
++    assert decision.metrics["recommended_subagents"] == 3
++
++
++def test_negated_write_guard_does_not_block_readonly_parallel_review():
++    prompts = [
++        "Review auth, billing, and search independently. Do not modify files.",
++        "Use parallel subagents to review auth, billing, and search. Do not edit files.",
++        "Read-only review auth, billing, and search independently. No file changes.",
++        "Review auth, billing, and search independently without modifying files.",
++    ]
++
++    for prompt in prompts:
++        decision = route_task(prompt)
++        assert decision.route is TaskRoute.PARALLEL_SUBAGENTS
++        assert "independent_workstreams" in decision.reasons
++        assert "small_related_batch" not in decision.reasons
++        assert decision.metrics["requires_shared_context"] is False
++        assert decision.metrics["recommended_subagents"] == 3
++        subtask_goals = "\n".join(subtask.goal for subtask in decision.subtasks)
++        assert "do not" not in subtask_goals
++        assert "without modifying" not in subtask_goals
++        assert "no file changes" not in subtask_goals
++
++
++def test_negated_write_guard_keeps_positive_write_requests_conservative():
++    decision = route_task("Review auth, billing, and search independently, then update docs. Do not edit tests.")
++
++    assert decision.route is TaskRoute.SERIAL
++    assert "dependent_steps" in decision.reasons
++    assert decision.metrics["recommended_subagents"] == 0
++
++
++def test_forbidden_subagents_still_override_readonly_guard():
++    decision = route_task("Do not use subagents; read-only review auth, billing, and search independently. No file changes.")
++
++    assert decision.route is TaskRoute.BATCHED_SINGLE_AGENT
++    assert "delegation_forbidden_by_user" in decision.reasons
++    assert decision.metrics["recommended_subagents"] == 0
+diff --git a/tests/agent/test_task_router_eval.py b/tests/agent/test_task_router_eval.py
+new file mode 100644
+index 000000000..dbfbff3e5
+--- /dev/null
++++ b/tests/agent/test_task_router_eval.py
+@@ -0,0 +1,503 @@
++"""Tests for deterministic task-router evaluation metrics."""
++
++import json
++from pathlib import Path
++
++import pytest
++
++from agent.task_router import TaskRoute, TaskRouteDecision, TaskRouterConfig
++from scripts.benchmark_task_router_configs import main as benchmark_task_router_main
++from scripts.evaluate_task_router import main as evaluate_task_router_main
++from agent.task_router_eval import (
++    TaskRouterBenchmarkVariant,
++    TaskRouterEvalCase,
++    benchmark_task_router_configs,
++    evaluate_task_router,
++    load_eval_cases,
++)
++
++FIXTURE_PATH = (
++    Path(__file__).resolve().parents[1] / "fixtures" / "task_router_eval_cases.jsonl"
++)
++
++
++def test_load_eval_cases_from_jsonl():
++    cases = load_eval_cases(FIXTURE_PATH)
++
++    assert len(cases) >= 12
++    assert cases[0].id == "empty_prompt"
++    assert cases[0].expected_route is TaskRoute.SERIAL
++    assert all(case.id for case in cases)
++
++
++def test_eval_summary_is_deterministic_and_serializable():
++    cases = load_eval_cases(FIXTURE_PATH)
++
++    first = evaluate_task_router(cases).to_dict()
++    second = evaluate_task_router(cases).to_dict()
++
++    assert first == second
++    encoded = json.dumps(first, sort_keys=True)
++    decoded = json.loads(encoded)
++    assert decoded["total"] == len(cases)
++    assert set(decoded["route_confusion"]) == {
++        "serial",
++        "batched_single_agent",
++        "parallel_subagents",
++    }
++    assert "reason_counts" in decoded
++
++
++def test_eval_counts_over_and_under_delegation_with_fake_routers():
++    cases = [
++        TaskRouterEvalCase(
++            id="expected_serial",
++            task="What is Redis?",
++            expected_route=TaskRoute.SERIAL,
++        ),
++        TaskRouterEvalCase(
++            id="expected_parallel",
++            task="Investigate a, b, and c independently.",
++            expected_route=TaskRoute.PARALLEL_SUBAGENTS,
++        ),
++    ]
++
++    def always_parallel(task: str, *, config=None):
++        return TaskRouteDecision(
++            route=TaskRoute.PARALLEL_SUBAGENTS,
++            reasons=("fake",),
++            metrics={
++                "estimated_subtasks": 3,
++                "parallelizable_subtasks": 3,
++                "recommended_subagents": 3,
++                "requires_shared_context": False,
++                "has_dependencies": False,
++                "safety_risk": False,
++            },
++        )
++
++    def always_serial(task: str, *, config=None):
++        return TaskRouteDecision(
++            route=TaskRoute.SERIAL,
++            reasons=("fake",),
++            metrics={
++                "estimated_subtasks": 1,
++                "parallelizable_subtasks": 0,
++                "recommended_subagents": 0,
++                "requires_shared_context": False,
++                "has_dependencies": False,
++                "safety_risk": False,
++            },
++        )
++
++    over_summary = evaluate_task_router(cases, router=always_parallel)
++    under_summary = evaluate_task_router(cases, router=always_serial)
++
++    assert over_summary.over_delegate_count == 1
++    assert over_summary.under_delegate_count == 0
++    assert under_summary.over_delegate_count == 0
++    assert under_summary.under_delegate_count == 1
++
++
++def test_eval_flags_unsafe_delegation_with_fake_router():
++    cases = [
++        TaskRouterEvalCase(
++            id="destructive",
++            task="Delete files and force push.",
++            expected_route=TaskRoute.SERIAL,
++            tags=("safety", "destructive"),
++        )
++    ]
++
++    def unsafe_parallel(task: str, *, config=None):
++        return TaskRouteDecision(
++            route=TaskRoute.PARALLEL_SUBAGENTS,
++            reasons=("fake",),
++            metrics={
++                "estimated_subtasks": 3,
++                "parallelizable_subtasks": 3,
++                "recommended_subagents": 3,
++                "requires_shared_context": False,
++                "has_dependencies": False,
++                "safety_risk": False,
++            },
++        )
++
++    summary = evaluate_task_router(cases, router=unsafe_parallel)
++
++    assert summary.unsafe_delegate_count == 1
++    assert summary.over_delegate_count == 1
++    assert summary.failed == 1
++    assert "route expected serial" in summary.results[0].failures[0]
++
++
++def test_current_router_passes_baseline_fixture():
++    cases = load_eval_cases(FIXTURE_PATH)
++    summary = evaluate_task_router(cases)
++
++    assert summary.total == len(cases)
++    assert summary.accuracy == 1.0
++    assert summary.failed == 0
++    assert summary.over_delegate_count == 0
++    assert summary.under_delegate_count == 0
++    assert summary.unsafe_delegate_count == 0
++    assert summary.route_confusion["parallel_subagents"]["parallel_subagents"] >= 2
++
++
++def test_config_can_disable_parallelism_in_eval():
++    cases = [
++        TaskRouterEvalCase(
++            id="disabled_parallel",
++            task="Investigate parser, cache, and retry logic independently.",
++            expected_route=TaskRoute.BATCHED_SINGLE_AGENT,
++            required_reasons=("parallel_disabled",),
++        )
++    ]
++
++    summary = evaluate_task_router(
++        cases,
++        config=TaskRouterConfig(enable_parallel_subagents=False),
++    )
++
++    assert summary.passed == 1
++    assert summary.results[0].decision.metrics["recommended_subagents"] == 0
++
++
++def test_eval_case_supports_expected_metrics_and_case_config():
++    case = TaskRouterEvalCase.from_dict(
++        {
++            "id": "case_config_cap",
++            "task": "Investigate auth, billing, telemetry, and search independently.",
++            "expected_route": "parallel_subagents",
++            "required_reasons": ["capped_parallelism"],
++            "expected_metrics": {"recommended_subagents": 2, "safety_risk": False},
++            "config": {"max_parallel_subagents": 2},
++            "tags": ["parallel", "config"],
++        }
++    )
++
++    summary = evaluate_task_router([case])
++
++    assert summary.passed == 1
++    assert summary.results[0].decision.metrics["recommended_subagents"] == 2
++    assert case.to_dict()["expected_metrics"] == {
++        "recommended_subagents": 2,
++        "safety_risk": False,
++    }
++    assert case.to_dict()["config"] == {
++        "enable_parallel_subagents": True,
++        "min_parallel_subtasks": 3,
++        "max_parallel_subagents": 2,
++    }
++
++
++def test_eval_case_expected_metric_mismatch_fails_clearly():
++    case = TaskRouterEvalCase(
++        id="metric_mismatch",
++        task="What is Redis?",
++        expected_route=TaskRoute.SERIAL,
++        expected_metrics={"estimated_subtasks": 99},
++    )
++
++    summary = evaluate_task_router([case])
++
++    assert summary.failed == 1
++    assert "metric estimated_subtasks expected 99" in summary.results[0].failures[0]
++
++
++def test_eval_summary_parallel_quality_and_tag_metrics():
++    cases = [
++        TaskRouterEvalCase(
++            id="serial",
++            task="What is Redis?",
++            expected_route=TaskRoute.SERIAL,
++            tags=("serial",),
++        ),
++        TaskRouterEvalCase(
++            id="parallel",
++            task="Investigate auth, billing, and telemetry independently.",
++            expected_route=TaskRoute.PARALLEL_SUBAGENTS,
++            tags=("parallel",),
++        ),
++    ]
++
++    def always_parallel(task: str, *, config=None):
++        return TaskRouteDecision(
++            route=TaskRoute.PARALLEL_SUBAGENTS,
++            reasons=("fake",),
++            metrics={
++                "estimated_subtasks": 3,
++                "parallelizable_subtasks": 3,
++                "recommended_subagents": 3,
++                "requires_shared_context": False,
++                "has_dependencies": False,
++                "safety_risk": False,
++            },
++        )
++
++    summary = evaluate_task_router(cases, router=always_parallel)
++
++    assert summary.expected_parallel_count == 1
++    assert summary.actual_parallel_count == 2
++    assert summary.parallel_true_positive_count == 1
++    assert summary.parallel_precision == 0.5
++    assert summary.parallel_recall == 1.0
++    assert round(summary.parallel_f1, 3) == 0.667
++    assert summary.total_recommended_subagents == 6
++    assert summary.tag_counts == {"parallel": 1, "serial": 1}
++    assert summary.tag_failures == {"serial": 1}
++    assert summary.tag_accuracy == {"parallel": 1.0, "serial": 0.0}
++
++
++def test_load_eval_cases_rejects_duplicate_ids(tmp_path):
++    cases_file = tmp_path / "cases.jsonl"
++    row = {"id": "dup", "task": "What is Redis?", "expected_route": "serial"}
++    cases_file.write_text(json.dumps(row) + "\n" + json.dumps(row) + "\n")
++
++    try:
++        load_eval_cases(cases_file)
++    except ValueError as exc:
++        assert "duplicate task router eval case id: dup" in str(exc)
++    else:  # pragma: no cover
++        raise AssertionError("duplicate IDs should fail")
++
++
++def test_load_eval_cases_reports_line_number_for_bad_json(tmp_path):
++    cases_file = tmp_path / "cases.jsonl"
++    cases_file.write_text(
++        json.dumps({"id": "ok", "task": "What is Redis?", "expected_route": "serial"})
++        + "\n{bad json}\n"
++    )
++
++    try:
++        load_eval_cases(cases_file)
++    except ValueError as exc:
++        assert f"{cases_file}:2" in str(exc)
++    else:  # pragma: no cover
++        raise AssertionError("malformed JSON should fail")
++
++
++def test_eval_corpus_has_single_canonical_fixture_location():
++    fixture_files = sorted(FIXTURE_PATH.parents[1].glob("**/task_router_eval_cases.jsonl"))
++
++    assert fixture_files == [FIXTURE_PATH]
++
++
++def test_evaluate_task_router_cli_default_passes(capsys):
++    exit_code = evaluate_task_router_main([])
++
++    captured = capsys.readouterr()
++    assert exit_code == 0
++    assert "task_router_eval:" in captured.out
++    assert "accuracy=1.000" in captured.out
++    assert "parallel_quality:" in captured.out
++    assert captured.err == ""
++
++
++def test_evaluate_task_router_cli_json_output_is_parseable(capsys):
++    exit_code = evaluate_task_router_main(["--json"])
++
++    captured = capsys.readouterr()
++    payload = json.loads(captured.out)
++    assert exit_code == 0
++    assert payload["total"] >= 25
++    assert payload["failed"] == 0
++    assert payload["over_delegate_count"] == 0
++    assert payload["under_delegate_count"] == 0
++    assert payload["parallel_precision"] == 1.0
++    assert payload["parallel_recall"] == 1.0
++
++
++def test_evaluate_task_router_cli_reports_failures_and_nonzero_exit(tmp_path, capsys):
++    cases_file = tmp_path / "cases.jsonl"
++    cases_file.write_text(
++        json.dumps(
++            {
++                "id": "intentionally_wrong",
++                "task": "What is Redis?",
++                "expected_route": "parallel_subagents",
++            }
++        )
++        + "\n"
++    )
++
++    exit_code = evaluate_task_router_main(["--cases", str(cases_file)])
++
++    captured = capsys.readouterr()
++    assert exit_code == 1
++    assert "task_router_eval: 0/1 passed" in captured.out
++    assert "FAIL intentionally_wrong:" in captured.out
++    assert "route expected parallel_subagents, got serial" in captured.out
++
++
++def test_evaluate_task_router_cli_threshold_flags_affect_exit_status(capsys):
++    assert evaluate_task_router_main(["--min-accuracy", "1.01"]) == 1
++    capsys.readouterr()
++
++    assert evaluate_task_router_main(["--disable-parallel-subagents"]) == 1
++    captured = capsys.readouterr()
++    assert "under=" in captured.out
++
++
++def test_evaluate_task_router_cli_empty_corpus_returns_usage_error(tmp_path, capsys):
++    cases_file = tmp_path / "empty.jsonl"
++    cases_file.write_text("\n")
++
++    exit_code = evaluate_task_router_main(["--cases", str(cases_file)])
++
++    captured = capsys.readouterr()
++    assert exit_code == 2
++    assert captured.out == ""
++    assert "task_router_eval: no cases loaded" in captured.err
++
++
++def test_benchmark_task_router_configs_compares_variants():
++    cases = load_eval_cases(FIXTURE_PATH)
++
++    summary = benchmark_task_router_configs(
++        iter(cases),
++        [
++            TaskRouterBenchmarkVariant("default", TaskRouterConfig()),
++            TaskRouterBenchmarkVariant(
++                "disabled",
++                TaskRouterConfig(enable_parallel_subagents=False),
++            ),
++        ],
++    )
++
++    assert set(summary.variants) == {"default", "disabled"}
++    assert summary.baseline_variant == "default"
++    assert summary.variants["default"].under_delegate_count == 0
++    assert summary.variants["disabled"].under_delegate_count > 0
++    assert summary.variants["disabled"].actual_parallel_count == 0
++    assert summary.variants["disabled"].total_recommended_subagents == 0
++    assert summary.deltas["disabled"].parallel_recall_delta < 0
++    assert summary.best_safe_variant == "default"
++
++
++def test_benchmark_can_opt_into_case_config_overrides():
++    cases = load_eval_cases(FIXTURE_PATH)
++
++    summary = benchmark_task_router_configs(
++        cases,
++        [
++            TaskRouterBenchmarkVariant("disabled", TaskRouterConfig(enable_parallel_subagents=False)),
++        ],
++        baseline_variant="disabled",
++        include_case_config_cases=True,
++    )
++
++    assert summary.variants["disabled"].actual_parallel_count == 1
++    assert summary.variants["disabled"].total_recommended_subagents == 3
++
++
++def test_benchmark_rejects_duplicate_variant_names():
++    cases = load_eval_cases(FIXTURE_PATH)
++
++    with pytest.raises(ValueError, match="duplicate benchmark variant"):
++        benchmark_task_router_configs(
++            cases,
++            [
++                TaskRouterBenchmarkVariant("default", TaskRouterConfig()),
++                TaskRouterBenchmarkVariant("default", TaskRouterConfig()),
++            ],
++        )
++
++
++def test_benchmark_rejects_missing_baseline_variant():
++    cases = load_eval_cases(FIXTURE_PATH)
++
++    with pytest.raises(ValueError, match="baseline variant not found"):
++        benchmark_task_router_configs(
++            cases,
++            [TaskRouterBenchmarkVariant("candidate", TaskRouterConfig())],
++            baseline_variant="default",
++        )
++
++
++def test_benchmark_rejects_empty_cases_or_variants():
++    with pytest.raises(ValueError, match="benchmark corpus is empty"):
++        benchmark_task_router_configs(
++            [],
++            [TaskRouterBenchmarkVariant("default", TaskRouterConfig())],
++        )
++
++    with pytest.raises(ValueError, match="at least one benchmark variant"):
++        benchmark_task_router_configs(
++            load_eval_cases(FIXTURE_PATH),
++            [],
++        )
++
++    with pytest.raises(ValueError, match="variant name must not be empty"):
++        benchmark_task_router_configs(
++            load_eval_cases(FIXTURE_PATH),
++            [TaskRouterBenchmarkVariant("  ", TaskRouterConfig())],
++        )
++
++
++def test_benchmark_summary_is_json_serializable_and_deterministic():
++    cases = load_eval_cases(FIXTURE_PATH)
++    variants = [
++        TaskRouterBenchmarkVariant("default", TaskRouterConfig()),
++        TaskRouterBenchmarkVariant("cap_2", TaskRouterConfig(max_parallel_subagents=2)),
++    ]
++
++    first = benchmark_task_router_configs(cases, variants).to_dict()
++    second = benchmark_task_router_configs(cases, variants).to_dict()
++
++    assert first == second
++    encoded = json.dumps(first, sort_keys=True)
++    decoded = json.loads(encoded)
++    assert decoded["baseline_variant"] == "default"
++    assert set(decoded) == {
++        "baseline_variant",
++        "variants",
++        "deltas",
++        "best_by_parallel_f1",
++        "best_safe_variant",
++    }
++    assert set(decoded["variants"]) == {"cap_2", "default"}
++
++
++def test_benchmark_cli_default_passes(capsys):
++    exit_code = benchmark_task_router_main([])
++
++    captured = capsys.readouterr()
++    assert exit_code == 0
++    assert "task_router_benchmark:" in captured.out
++    assert "baseline=default" in captured.out
++    assert "best_by_parallel_f1=" in captured.out
++    assert captured.err == ""
++
++
++def test_benchmark_cli_json_output_is_parseable(capsys):
++    exit_code = benchmark_task_router_main(["--json"])
++
++    captured = capsys.readouterr()
++    payload = json.loads(captured.out)
++    assert exit_code == 0
++    assert payload["baseline_variant"] == "default"
++    assert "variants" in payload
++    assert "default" in payload["variants"]
++    assert "disabled" in payload["variants"]
++    assert "deltas" in payload
++
++
++def test_benchmark_cli_baseline_gate_failure_exits_nonzero(capsys):
++    exit_code = benchmark_task_router_main(["--min-baseline-accuracy", "1.01"])
++
++    captured = capsys.readouterr()
++    assert exit_code == 1
++    assert "task_router_benchmark:" in captured.out
++
++
++def test_benchmark_cli_empty_corpus_returns_usage_error(tmp_path, capsys):
++    cases_file = tmp_path / "empty.jsonl"
++    cases_file.write_text("\n")
++
++    exit_code = benchmark_task_router_main(["--cases", str(cases_file)])
++
++    captured = capsys.readouterr()
++    assert exit_code == 2
++    assert captured.out == ""
++    assert "benchmark corpus is empty" in captured.err
+diff --git a/tests/fixtures/task_router_eval_cases.jsonl b/tests/fixtures/task_router_eval_cases.jsonl
+new file mode 100644
+index 000000000..58a620781
+--- /dev/null
++++ b/tests/fixtures/task_router_eval_cases.jsonl
+@@ -0,0 +1,29 @@
++{"id":"empty_prompt","task":"   ","expected_route":"serial","required_reasons":["empty_task"],"tags":["serial"]}
++{"id":"simple_definition","task":"What is a Python virtualenv?","expected_route":"serial","required_reasons":["simple"],"tags":["serial","simple"]}
++{"id":"ambiguous_single_task","task":"Look into the cache behavior.","expected_route":"serial","required_reasons":["ambiguous"],"tags":["serial","ambiguous"]}
++{"id":"dependent_chain","task":"First inspect the API, then based on that result update the caller.","expected_route":"serial","required_reasons":["dependent_steps"],"tags":["serial","dependent","write_heavy"]}
++{"id":"destructive_force_push","task":"Delete unused files and force push the cleaned branch.","expected_route":"serial","required_reasons":["safety_guard"],"tags":["serial","safety","destructive","write_heavy"]}
++{"id":"safety_beats_parallel","task":"Independently audit auth, billing, and production secrets before deleting stale configs.","expected_route":"serial","required_reasons":["safety_guard"],"tags":["serial","safety","destructive"]}
++{"id":"homogeneous_formatting_batch","task":"Apply the same formatting cleanup to README.md, docs/usage.md, and docs/config.md.","expected_route":"batched_single_agent","required_reasons":["homogeneous_batch"],"tags":["batched","homogeneous","write_heavy"]}
++{"id":"write_heavy_single_related_task","task":"Edit foo.py and update the tests and README.","expected_route":"serial","required_reasons":["ambiguous"],"tags":["serial","write_heavy"]}
++{"id":"multiple_readonly_items_without_parallel_signal","task":"Review auth, billing, and search.","expected_route":"batched_single_agent","required_reasons":["multiple_items"],"tags":["batched","readonly"]}
++{"id":"parallel_readonly_3_workstreams","task":"Investigate the CLI startup path, gateway batching, and tool sandbox independently.","expected_route":"parallel_subagents","required_reasons":["independent_workstreams"],"min_recommended_subagents":3,"tags":["parallel","readonly","independent"]}
++{"id":"parallel_capped_many_items","task":"Analyze auth, billing, notifications, search, indexing, telemetry, and permissions independently.","expected_route":"parallel_subagents","required_reasons":["independent_workstreams","capped_parallelism"],"max_recommended_subagents":4,"tags":["parallel","readonly","independent","capped"]}
++{"id":"threshold_two_items","task":"Compare parser and renderer independently.","expected_route":"batched_single_agent","required_reasons":["below_parallel_threshold","multiple_items"],"forbidden_reasons":["independent_workstreams"],"tags":["batched","threshold","readonly"]}
++{"id":"parallel_disabled_case_config","task":"Investigate CLI, gateway, and memory independently.","expected_route":"batched_single_agent","required_reasons":["parallel_disabled"],"expected_metrics":{"recommended_subagents":0},"config":{"enable_parallel_subagents":false},"tags":["config","batched","readonly"]}
++{"id":"parallel_capped_three_case_config","task":"Analyze auth, billing, notifications, search, and telemetry independently.","expected_route":"parallel_subagents","required_reasons":["independent_workstreams","capped_parallelism"],"expected_metrics":{"recommended_subagents":3},"config":{"max_parallel_subagents":3},"tags":["config","parallel","readonly","capped"]}
++{"id":"explicit_use_subagents_three_readonly","task":"Use subagents to audit auth, billing, and search.","expected_route":"parallel_subagents","required_reasons":["independent_workstreams"],"min_recommended_subagents":3,"expected_metrics":{"recommended_subagents":3},"tags":["parallel","readonly","explicit_subagents"]}
++{"id":"explicit_delegate_separate_agents","task":"Please delegate auth, billing, and search review to separate agents.","expected_route":"parallel_subagents","required_reasons":["independent_workstreams"],"min_recommended_subagents":3,"tags":["parallel","readonly","explicit_subagents"]}
++{"id":"explicit_two_subagents_threshold_override","task":"Use two subagents to compare Redis and SQLite independently.","expected_route":"parallel_subagents","required_reasons":["independent_workstreams"],"min_recommended_subagents":2,"max_recommended_subagents":2,"tags":["parallel","readonly","explicit_subagents","threshold"]}
++{"id":"explicit_no_subagents_overrides_independent","task":"Do not use subagents; review auth, billing, and search independently.","expected_route":"batched_single_agent","required_reasons":["delegation_forbidden_by_user"],"forbidden_reasons":["independent_workstreams"],"forbidden_routes":["parallel_subagents"],"expected_metrics":{"recommended_subagents":0},"tags":["batched","readonly","explicit_no_subagents"]}
++{"id":"unsafe_secret_names_block_parallel","task":"Independently audit production API keys, database passwords, and OAuth tokens.","expected_route":"serial","required_reasons":["safety_guard"],"forbidden_reasons":["independent_workstreams"],"expected_metrics":{"safety_risk":true,"recommended_subagents":0},"tags":["serial","safety","secrets"]}
++{"id":"readonly_delete_behavior_not_destructive","task":"Research delete command behavior, rm safety, and cleanup UX independently.","expected_route":"parallel_subagents","required_reasons":["independent_workstreams"],"min_recommended_subagents":3,"tags":["parallel","readonly","safety_false_positive"]}
++{"id":"temporal_after_not_dependency","task":"Audit auth, billing, and search after the refactor independently.","expected_route":"parallel_subagents","required_reasons":["independent_workstreams"],"min_recommended_subagents":3,"tags":["parallel","readonly","dependency_false_positive"]}
++{"id":"semicolon_no_changes_qualifier_not_item","task":"Analyze auth, billing, and search independently; do not write changes.","expected_route":"parallel_subagents","required_reasons":["independent_workstreams"],"min_recommended_subagents":3,"tags":["parallel","readonly","item_extraction"]}
++{"id":"check_readonly_independent","task":"Check auth, billing, and search independently.","expected_route":"parallel_subagents","required_reasons":["independent_workstreams"],"min_recommended_subagents":3,"tags":["parallel","readonly"]}
++{"id":"fixture_case_config_parallel_disabled","task":"Investigate parser, cache, and retry logic independently.","expected_route":"batched_single_agent","required_reasons":["parallel_disabled"],"forbidden_routes":["parallel_subagents"],"expected_metrics":{"recommended_subagents":0},"config":{"enable_parallel_subagents":false},"tags":["batched","config"]}
++{"id":"explicit_no_any_subagents_overrides_independent","task":"Please do not use any subagents; review auth, billing, and search independently.","expected_route":"batched_single_agent","required_reasons":["delegation_forbidden_by_user"],"forbidden_reasons":["independent_workstreams"],"forbidden_routes":["parallel_subagents"],"expected_metrics":{"recommended_subagents":0},"tags":["batched","readonly","explicit_no_subagents"]}
++{"id":"period_do_not_modify_files_readonly_parallel","task":"Review auth, billing, and search independently. Do not modify files.","expected_route":"parallel_subagents","required_reasons":["independent_workstreams"],"forbidden_reasons":["small_related_batch"],"expected_metrics":{"recommended_subagents":3,"requires_shared_context":false},"tags":["parallel","readonly","negated_write","item_extraction"]}
++{"id":"explicit_subagents_do_not_edit_files_readonly_parallel","task":"Use parallel subagents to review auth, billing, and search. Do not edit files.","expected_route":"parallel_subagents","required_reasons":["independent_workstreams"],"forbidden_reasons":["small_related_batch"],"expected_metrics":{"recommended_subagents":3,"requires_shared_context":false},"tags":["parallel","readonly","explicit_subagents","negated_write"]}
++{"id":"no_file_changes_readonly_parallel","task":"Read-only review auth, billing, and search independently. No file changes.","expected_route":"parallel_subagents","required_reasons":["independent_workstreams"],"forbidden_reasons":["small_related_batch"],"expected_metrics":{"recommended_subagents":3,"requires_shared_context":false},"tags":["parallel","readonly","negated_write"]}
++{"id":"forbidden_subagents_with_readonly_guard","task":"Do not use subagents; read-only review auth, billing, and search independently. No file changes.","expected_route":"batched_single_agent","required_reasons":["delegation_forbidden_by_user"],"forbidden_reasons":["independent_workstreams"],"forbidden_routes":["parallel_subagents"],"expected_metrics":{"recommended_subagents":0},"tags":["batched","readonly","explicit_no_subagents","negated_write"]}
+-- 
+2.51.0
+

@@ -1,0 +1,273 @@
+From 4238a7bad694f6bd51605597bf8110402c02e4ab Mon Sep 17 00:00:00 2001
+From: mojomast <mojomast@users.noreply.github.com>
+Date: Tue, 2 Jun 2026 14:37:58 -0400
+Subject: [PATCH 2/9] fix: harden self-improvement privacy redaction
+
+---
+ agent/semantic_code_index.py            | 22 ++++++++-
+ agent/training_episodes.py              | 65 ++++++++++++++++++-------
+ tests/agent/test_semantic_code_index.py | 31 ++++++++++++
+ tests/agent/test_training_episodes.py   | 56 +++++++++++++++++++++
+ 4 files changed, 156 insertions(+), 18 deletions(-)
+
+diff --git a/agent/semantic_code_index.py b/agent/semantic_code_index.py
+index bf3912412..f7d99e1fb 100644
+--- a/agent/semantic_code_index.py
++++ b/agent/semantic_code_index.py
+@@ -188,6 +188,26 @@ def _js_var_decl_kind(line: str, match: re.Match[str]) -> str:
+     return "variable"
+ 
+ 
++def _sanitize_js_diagnostic(raw_message: str) -> str:
++    """Keep parser diagnostics useful without including source excerpts."""
++    safe_lines: List[str] = []
++    for line in raw_message.splitlines():
++        stripped = line.strip()
++        if not stripped or stripped.startswith((">", "^")):
++            continue
++        if re.search(r"\.[cm]?js:\d+", stripped):
++            safe_lines.append(stripped)
++            continue
++        if stripped.startswith("SyntaxError:") or stripped.startswith("Error:"):
++            safe_lines.append(stripped)
++            continue
++        if stripped.startswith("at "):
++            continue
++    if safe_lines:
++        return " | ".join(safe_lines)[:500]
++    return "JavaScript syntax check failed"
++
++
+ def parse_js_like(path: Path, root: Path, include_context: bool = False) -> tuple[List[CodeSymbol], List[CodeReference], List[CodeDiagnostic]]:
+     rel = str(path.relative_to(root))
+     text = path.read_text(encoding="utf-8", errors="replace")
+@@ -219,7 +239,7 @@ def parse_js_like(path: Path, root: Path, include_context: bool = False) -> tupl
+         try:
+             proc = subprocess.run(["node", "--check", str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+             if proc.returncode != 0:
+-                diagnostics.append(CodeDiagnostic(path=rel, line=1, column=0, severity="error", message=(proc.stderr or proc.stdout).strip()[:500], source="node --check"))
++                diagnostics.append(CodeDiagnostic(path=rel, line=1, column=0, severity="error", message=_sanitize_js_diagnostic(proc.stderr or proc.stdout), source="node --check"))
+         except (FileNotFoundError, subprocess.TimeoutExpired):
+             pass
+     return symbols, refs, diagnostics
+diff --git a/agent/training_episodes.py b/agent/training_episodes.py
+index 593cfedac..f73f20b5d 100644
+--- a/agent/training_episodes.py
++++ b/agent/training_episodes.py
+@@ -42,6 +42,27 @@ RAW_CONTENT_KEYS = {
+     "input",
+     "env",
+ }
++RAW_CONTENT_KEY_MARKERS = (
++    "result",
++    "output",
++    "prompt",
++    "message",
++    "content",
++    "stdout",
++    "stderr",
++    "body",
++    "payload",
++    "headers",
++    "args",
++    "arguments",
++    "command",
++    "input",
++    "env",
++    "response",
++    "transcript",
++    "completion",
++    "observation",
++)
+ RAW_PAYLOAD_REDACTION = "[REDACTED_RAW_PAYLOAD]"
+ GENERATED_ARTIFACT_PATTERNS = (
+     ".jsonl", ".db", ".sqlite", ".sqlite3", ".npy", ".pt", ".pth",
+@@ -125,33 +146,43 @@ def _raw_payload_digest(value: Any) -> Dict[str, Any]:
+     }
+ 
+ 
++def _is_raw_content_key(key: str) -> bool:
++    """Return True for raw-payload fields, including common compound aliases."""
++    normalized = key.lower()
++    if normalized in RAW_CONTENT_KEYS:
++        return True
++    key_parts = [part for part in re.split(r"[^a-z0-9]+", normalized) if part]
++    return any(part in RAW_CONTENT_KEY_MARKERS for part in key_parts)
++
++
++def _minimize_value(value: Any) -> Any:
++    if isinstance(value, (bool, int, float)) or value is None:
++        return value
++    if isinstance(value, str):
++        if SECRET_RE.search(value):
++            return "[REDACTED]"
++        if len(value) > 160:
++            return {"truncated": True, "length": len(value), "sha256_prefix": hashlib.sha256(value.encode('utf-8', 'replace')).hexdigest()[:16]}
++        return value
++    if isinstance(value, (list, tuple)):
++        return [_minimize_value(v) for v in list(value)[:10]]
++    if isinstance(value, dict):
++        return minimize_payload({str(a): b for a, b in list(value.items())[:10]})
++    return str(value)[:120]
++
++
+ def minimize_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+     """Return JSON-safe metadata with secrets and raw-content payloads stripped."""
+     safe: Dict[str, Any] = {}
+     for key, value in list(data.items())[:40]:
+         k = str(key)
+-        normalized_key = k.lower()
+-        if normalized_key in RAW_CONTENT_KEYS:
++        if _is_raw_content_key(k):
+             safe[k] = _raw_payload_digest(value)
+             continue
+         if SECRET_RE.search(k):
+             safe[k] = "[REDACTED]"
+             continue
+-        if isinstance(value, (bool, int, float)) or value is None:
+-            safe[k] = value
+-        elif isinstance(value, str):
+-            if SECRET_RE.search(value):
+-                safe[k] = "[REDACTED]"
+-            elif len(value) > 160:
+-                safe[k] = {"truncated": True, "length": len(value), "sha256_prefix": hashlib.sha256(value.encode('utf-8', 'replace')).hexdigest()[:16]}
+-            else:
+-                safe[k] = value
+-        elif isinstance(value, (list, tuple)):
+-            safe[k] = [str(v)[:80] for v in value[:10]]
+-        elif isinstance(value, dict):
+-            safe[k] = minimize_payload({str(a): b for a, b in list(value.items())[:10]})
+-        else:
+-            safe[k] = str(value)[:120]
++        safe[k] = _minimize_value(value)
+     return safe
+ 
+ 
+diff --git a/tests/agent/test_semantic_code_index.py b/tests/agent/test_semantic_code_index.py
+index e107bf0c4..ebee2bebc 100644
+--- a/tests/agent/test_semantic_code_index.py
++++ b/tests/agent/test_semantic_code_index.py
+@@ -1,4 +1,5 @@
+ import json
++import subprocess
+ 
+ from agent.semantic_code_index import cache_path_for, get_diagnostics, go_to_definition, list_references, semantic_lookup
+ 
+@@ -88,3 +89,33 @@ def test_reference_context_privacy_default_and_cache_safety(tmp_path):
+     opt_in_refs = semantic_lookup(project, "references", query="SECRET_SNIPPET", include_context=True)
+     assert any(secret_line in r.get("context", "") for r in opt_in_refs["references"])
+     assert secret_line not in cache_path.read_text(encoding="utf-8")
++
++
++def test_javascript_diagnostics_omit_source_excerpts_by_default(tmp_path, monkeypatch):
++    project = tmp_path / "js-private"
++    project.mkdir()
++    private_literal = "PRIVATE_PATIENT_LAVENDER_OTTER"
++    (project / "broken.js").write_text(f"const secret = '{private_literal}'\nfunction nope( {{\n", encoding="utf-8")
++
++    def fake_run(*args, **kwargs):
++        return subprocess.CompletedProcess(
++            args=args[0],
++            returncode=1,
++            stdout="",
++            stderr=(
++                f"{project / 'broken.js'}:2\n"
++                f"function nope( {{ // {private_literal}\n"
++                "               ^\n"
++                "SyntaxError: Unexpected token '{'\n"
++                "    at internal/main/check_syntax:1:1\n"
++            ),
++        )
++
++    monkeypatch.setattr("agent.semantic_code_index.subprocess.run", fake_run)
++
++    diagnostics = get_diagnostics(project)
++    diagnostic_blob = json.dumps(diagnostics)
++
++    assert diagnostics["total"] == 1
++    assert "SyntaxError: Unexpected token" in diagnostics["diagnostics"][0]["message"]
++    assert private_literal not in diagnostic_blob
+diff --git a/tests/agent/test_training_episodes.py b/tests/agent/test_training_episodes.py
+index f7e372081..fd89024a8 100644
+--- a/tests/agent/test_training_episodes.py
++++ b/tests/agent/test_training_episodes.py
+@@ -44,6 +44,8 @@ def test_raw_content_keys_redact_non_secret_private_text():
+     private_result = "private project note: launch codename velvet-mango"
+     private_stdout = "stdout contained internal customer migration details"
+     private_prompt = "prompt asked about a confidential family matter"
++    private_response = "assistant response included patient name lavender otter"
++    private_transcript = "call transcript included home address marmalade lane"
+     trace = {
+         "trace_id": "trace-raw-redaction",
+         "session_id": "sess",
+@@ -68,6 +70,8 @@ def test_raw_content_keys_redact_non_secret_private_text():
+                     "result": private_result,
+                     "stdout": private_stdout,
+                     "nested": {"prompt": private_prompt},
++                    "tool_response": private_response,
++                    "chat_history_transcript": private_transcript,
+                 }
+             ),
+         },
+@@ -88,6 +92,58 @@ def test_raw_content_keys_redact_non_secret_private_text():
+     assert private_result not in episode_blob
+     assert private_stdout not in episode_blob
+     assert private_prompt not in episode_blob
++    assert private_response not in episode_blob
++    assert private_transcript not in episode_blob
++
++
++def test_nested_list_metadata_redacts_raw_payloads_and_secrets():
++    private_prompt = "prompt asked for a confidential acquisition codename blue-raccoon"
++    secret_token = "sk-test-private-token-123456"
++    trace = {
++        "trace_id": "trace-list-redaction",
++        "session_id": "sess",
++        "turn_id": "turn",
++        "user_message_hash": "hash",
++        "start_time": 1.0,
++        "end_time": 2.0,
++        "total_wall_ms": 1000,
++        "total_model_calls": 1,
++        "status": "completed",
++    }
++    spans = [
++        {
++            "span_type": "tool_call",
++            "name": "execute_code",
++            "status": "completed",
++            "start_time": 1.0,
++            "end_time": 1.1,
++            "error_class": None,
++            "metadata_json": json.dumps(
++                {
++                    "events": [
++                        {"prompt": private_prompt},
++                        {"api_key": secret_token},
++                    ]
++                }
++            ),
++        },
++        {
++            "span_type": "final_answer",
++            "name": "turn.final_answer",
++            "status": "completed",
++            "start_time": 1.1,
++            "end_time": 2.0,
++            "error_class": None,
++            "metadata_json": json.dumps({"completed": True}),
++        },
++    ]
++
++    episode_blob = json.dumps(trace_to_episode(trace, spans).to_dict())
++
++    assert "[REDACTED_RAW_PAYLOAD]" in episode_blob
++    assert "[REDACTED]" in episode_blob
++    assert private_prompt not in episode_blob
++    assert secret_token not in episode_blob
+ 
+ 
+ def test_failed_tool_call_lowers_reward_and_blocks_training(tmp_path):
+-- 
+2.51.0
+

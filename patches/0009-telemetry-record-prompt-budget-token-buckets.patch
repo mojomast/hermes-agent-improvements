@@ -1,0 +1,654 @@
+From 7d34e599925c09d25f3bb58e726bbdd87f42c723 Mon Sep 17 00:00:00 2001
+From: mojomast <mojomast@users.noreply.github.com>
+Date: Tue, 2 Jun 2026 18:43:03 -0400
+Subject: [PATCH 9/9] telemetry: record prompt budget token buckets
+
+---
+ agent/prompt_budget.py               | 212 +++++++++++++++++++++++++++
+ hermes_state.py                      |  74 ++++++++++
+ run_agent.py                         |  46 +++++-
+ tests/agent/test_prompt_budget.py    | 106 ++++++++++++++
+ tests/agent/test_prompt_budget_db.py |  54 +++++++
+ 5 files changed, 491 insertions(+), 1 deletion(-)
+ create mode 100644 agent/prompt_budget.py
+ create mode 100644 tests/agent/test_prompt_budget.py
+ create mode 100644 tests/agent/test_prompt_budget_db.py
+
+diff --git a/agent/prompt_budget.py b/agent/prompt_budget.py
+new file mode 100644
+index 000000000..e056dd94f
+--- /dev/null
++++ b/agent/prompt_budget.py
+@@ -0,0 +1,212 @@
++"""Prompt budget accounting helpers.
++
++This module records token *counts only* for prompt components. It intentionally
++never persists prompt text, tool schemas, tool arguments/results, API keys, or
++other secret-bearing content.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++from functools import lru_cache
++from typing import Any, Dict, Iterable, Mapping, Optional
++
++logger = logging.getLogger(__name__)
++
++
++@lru_cache(maxsize=1)
++def _get_token_encoder() -> Any | None:
++    """Return a cached tiktoken encoder when available.
++
++    Prompt budgeting calls this helper many times per turn. Caching both the
++    encoder and the import-miss path avoids repeated import/lookup overhead in
++    environments where ``tiktoken`` is unavailable while preserving the existing
++    chars/4 fallback behavior.
++    """
++    try:
++        import tiktoken  # type: ignore
++    except Exception:
++        return None
++
++    try:
++        return tiktoken.get_encoding("cl100k_base")
++    except Exception:
++        try:
++            return tiktoken.encoding_for_model("gpt-4")
++        except Exception:
++            return None
++
++
++def estimate_token_count(value: Any) -> int:
++    """Estimate tokens using tiktoken when available, falling back to chars/4."""
++    if value is None:
++        return 0
++    if isinstance(value, str):
++        text = value
++    else:
++        try:
++            text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
++        except Exception:
++            text = str(value)
++    if not text:
++        return 0
++
++    enc = _get_token_encoder()
++    if enc is not None:
++        try:
++            return int(len(enc.encode(text)))
++        except Exception:
++            pass
++    return max(1, int((len(text) + 3) // 4))
++
++
++def _sum_message_tokens(messages: Iterable[Mapping[str, Any]]) -> int:
++    total = 0
++    for msg in messages or []:
++        total += estimate_token_count(msg)
++    return total
++
++
++def build_prompt_budget_record(
++    *,
++    trace_id: Optional[str],
++    session_id: Optional[str],
++    turn_id: Optional[str],
++    api_messages: list[dict[str, Any]],
++    tools: Optional[list[dict[str, Any]]],
++    system_components: Optional[Dict[str, str]] = None,
++    current_user_message_index: Optional[int] = None,
++    memory_injection: str = "",
++    plugin_user_context: str = "",
++    available_output_budget: Optional[int] = None,
++) -> Dict[str, int | str | None]:
++    """Return a content-free prompt budget row for ``prompt_budgets``.
++
++    ``current_user_message_index`` is the index in ``api_messages`` after any
++    system/prefill insertion and sanitizer pass. If unknown, the last user
++    message is treated as the current user message.
++    """
++    components = system_components or {}
++    total_system_text_tokens = estimate_token_count(components.get("system_prompt", ""))
++    memory_tokens = estimate_token_count(components.get("memory", "")) + estimate_token_count(memory_injection)
++    user_profile_tokens = estimate_token_count(components.get("user_profile", ""))
++    context_file_tokens = estimate_token_count(components.get("context_files", ""))
++    # If system_prompt is the full assembled prompt, subtract known sub-buckets
++    # so totals do not double count memory/profile/context file content.
++    system_prompt_tokens = max(
++        0,
++        total_system_text_tokens
++        - estimate_token_count(components.get("memory", ""))
++        - user_profile_tokens
++        - context_file_tokens,
++    )
++
++    tool_schema_tokens = estimate_token_count(tools or [])
++
++    developer_prompt_tokens = 0
++    conversation_history_tokens = 0
++    tool_result_tokens = 0
++    current_user_message_tokens = 0
++
++    if current_user_message_index is None or not (0 <= current_user_message_index < len(api_messages)):
++        for idx in range(len(api_messages) - 1, -1, -1):
++            if api_messages[idx].get("role") == "user":
++                current_user_message_index = idx
++                break
++
++    for idx, msg in enumerate(api_messages or []):
++        role = msg.get("role")
++        tok = estimate_token_count(msg)
++        if role == "system":
++            # System prompt is broken down from components above. If the prompt
++            # came from a stored session and no components are available, count
++            # the whole system message as system_prompt_tokens.
++            if not components:
++                system_prompt_tokens += tok
++            continue
++        if role == "developer":
++            developer_prompt_tokens += tok
++            continue
++        if idx == current_user_message_index and role == "user":
++            # Current user message may include ephemeral memory context appended
++            # to the API copy; that context is counted in memory_tokens above.
++            tok = max(0, tok - estimate_token_count(memory_injection))
++            current_user_message_tokens += tok
++            # Plugin context has no dedicated DB column; subtracting it from the
++            # current user message would hide input tokens, so leave it included.
++            _ = plugin_user_context
++            continue
++        if role == "tool":
++            tool_result_tokens += tok
++            continue
++        conversation_history_tokens += tok
++
++    total_input_tokens = (
++        system_prompt_tokens
++        + developer_prompt_tokens
++        + tool_schema_tokens
++        + memory_tokens
++        + user_profile_tokens
++        + conversation_history_tokens
++        + context_file_tokens
++        + tool_result_tokens
++        + current_user_message_tokens
++    )
++
++    return {
++        "trace_id": trace_id,
++        "session_id": session_id,
++        "turn_id": turn_id,
++        "system_prompt_tokens": int(system_prompt_tokens),
++        "developer_prompt_tokens": int(developer_prompt_tokens),
++        "tool_schema_tokens": int(tool_schema_tokens),
++        "memory_tokens": int(memory_tokens),
++        "user_profile_tokens": int(user_profile_tokens),
++        "conversation_history_tokens": int(conversation_history_tokens),
++        "context_file_tokens": int(context_file_tokens),
++        "tool_result_tokens": int(tool_result_tokens),
++        "current_user_message_tokens": int(current_user_message_tokens),
++        "total_input_tokens": int(total_input_tokens),
++        "available_output_budget": None if available_output_budget is None else int(available_output_budget),
++    }
++
++
++def emit_prompt_budget_warnings(record: Mapping[str, Any]) -> None:
++    """Log threshold warnings using counts only (no prompt content)."""
++    total = int(record.get("total_input_tokens") or 0)
++    if total <= 0:
++        return
++
++    def pct(name: str) -> float:
++        return float(record.get(name) or 0) / float(total)
++
++    warnings: list[str] = []
++    # Heuristic for trivial no-tool requests: short current message, no tools,
++    # little prior history/tool output, yet a large input prompt.
++    if (
++        total > 5000
++        and int(record.get("tool_schema_tokens") or 0) == 0
++        and int(record.get("current_user_message_tokens") or 0) <= 80
++        and int(record.get("tool_result_tokens") or 0) == 0
++    ):
++        warnings.append("total_input_tokens_gt_5000_for_trivial_no_tool_request")
++    if pct("memory_tokens") > 0.20:
++        warnings.append("memory_tokens_gt_20_percent")
++    if pct("tool_schema_tokens") > 0.25:
++        warnings.append("tool_schema_tokens_gt_25_percent")
++    if pct("conversation_history_tokens") > 0.50:
++        warnings.append("conversation_history_tokens_gt_50_percent")
++
++    if warnings:
++        logger.warning(
++            "Prompt budget threshold warning session=%s turn=%s total=%d warnings=%s "
++            "memory=%d tool_schema=%d history=%d",
++            record.get("session_id") or "",
++            record.get("turn_id") or "",
++            total,
++            ",".join(warnings),
++            int(record.get("memory_tokens") or 0),
++            int(record.get("tool_schema_tokens") or 0),
++            int(record.get("conversation_history_tokens") or 0),
++        )
+diff --git a/hermes_state.py b/hermes_state.py
+index 82d6b41fa..7f168ebec 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -21,6 +21,7 @@ import re
+ import sqlite3
+ import threading
+ import time
++import uuid
+ from pathlib import Path
+ from hermes_constants import get_hermes_home
+ from typing import Any, Callable, Dict, List, Optional, TypeVar
+@@ -33,6 +34,29 @@ DEFAULT_DB_PATH = get_hermes_home() / "state.db"
+ 
+ SCHEMA_VERSION = 8
+ 
++PROMPT_BUDGETS_SQL = """
++CREATE TABLE IF NOT EXISTS prompt_budgets (
++    budget_id TEXT PRIMARY KEY,
++    trace_id TEXT,
++    session_id TEXT,
++    turn_id TEXT,
++    timestamp REAL NOT NULL,
++    system_prompt_tokens INTEGER DEFAULT 0,
++    developer_prompt_tokens INTEGER DEFAULT 0,
++    tool_schema_tokens INTEGER DEFAULT 0,
++    memory_tokens INTEGER DEFAULT 0,
++    user_profile_tokens INTEGER DEFAULT 0,
++    conversation_history_tokens INTEGER DEFAULT 0,
++    context_file_tokens INTEGER DEFAULT 0,
++    tool_result_tokens INTEGER DEFAULT 0,
++    current_user_message_tokens INTEGER DEFAULT 0,
++    total_input_tokens INTEGER DEFAULT 0,
++    available_output_budget INTEGER
++);
++CREATE INDEX IF NOT EXISTS idx_prompt_budgets_session_time ON prompt_budgets(session_id, timestamp DESC);
++CREATE INDEX IF NOT EXISTS idx_prompt_budgets_trace ON prompt_budgets(trace_id);
++"""
++
+ SCHEMA_SQL = """
+ CREATE TABLE IF NOT EXISTS schema_version (
+     version INTEGER NOT NULL
+@@ -261,6 +285,9 @@ class SessionDB:
+         cursor = self._conn.cursor()
+ 
+         cursor.executescript(SCHEMA_SQL)
++        # Forward-only prompt budget telemetry. Additive, idempotent DDL;
++        # records token counts only (no prompts, tool args/results, or secrets).
++        cursor.executescript(PROMPT_BUDGETS_SQL)
+ 
+         # Check schema version and run migrations
+         cursor.execute("SELECT version FROM schema_version LIMIT 1")
+@@ -569,6 +596,53 @@ class SessionDB:
+             conn.execute(sql, params)
+         self._execute_write(_do)
+ 
++    def record_prompt_budget(self, budget_row: Dict[str, Any]) -> str:
++        """Persist prompt token breakdown telemetry.
++
++        The row must contain counts only. This method intentionally stores no
++        prompt text, message content, tool schemas, tool arguments/results, API
++        keys, headers, or provider request payloads.
++        """
++        budget_id = str(budget_row.get("budget_id") or uuid.uuid4())
++        timestamp = float(budget_row.get("timestamp") or time.time())
++
++        def _int(value, default=0):
++            if value is None:
++                return default
++            return int(value)
++
++        def _do(conn):
++            conn.execute(
++                """INSERT INTO prompt_budgets (
++                       budget_id, trace_id, session_id, turn_id, timestamp,
++                       system_prompt_tokens, developer_prompt_tokens,
++                       tool_schema_tokens, memory_tokens, user_profile_tokens,
++                       conversation_history_tokens, context_file_tokens,
++                       tool_result_tokens, current_user_message_tokens,
++                       total_input_tokens, available_output_budget
++                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
++                (
++                    budget_id,
++                    budget_row.get("trace_id"),
++                    budget_row.get("session_id"),
++                    budget_row.get("turn_id"),
++                    timestamp,
++                    _int(budget_row.get("system_prompt_tokens")),
++                    _int(budget_row.get("developer_prompt_tokens")),
++                    _int(budget_row.get("tool_schema_tokens")),
++                    _int(budget_row.get("memory_tokens")),
++                    _int(budget_row.get("user_profile_tokens")),
++                    _int(budget_row.get("conversation_history_tokens")),
++                    _int(budget_row.get("context_file_tokens")),
++                    _int(budget_row.get("tool_result_tokens")),
++                    _int(budget_row.get("current_user_message_tokens")),
++                    _int(budget_row.get("total_input_tokens")),
++                    None if budget_row.get("available_output_budget") is None else _int(budget_row.get("available_output_budget")),
++                ),
++            )
++        self._execute_write(_do)
++        return budget_id
++
+     def ensure_session(
+         self,
+         session_id: str,
+diff --git a/run_agent.py b/run_agent.py
+index 8b1276e88..afe38f2b9 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -116,6 +116,7 @@ from agent.trajectory import (
+     convert_scratchpad_to_think, has_incomplete_scratchpad,
+     save_trajectory as _save_trajectory_to_file,
+ )
++from agent.prompt_budget import build_prompt_budget_record, emit_prompt_budget_warnings
+ from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_var_enabled, normalize_proxy_url
+ 
+ 
+@@ -4425,6 +4426,9 @@ class AIAgent:
+         #   7. Platform-specific formatting hint
+ 
+         # Try SOUL.md as primary identity (unless context files are skipped)
++        _prompt_budget_memory_parts = []
++        _prompt_budget_user_profile_parts = []
++        _prompt_budget_context_file_parts = []
+         _soul_loaded = False
+         if not self.skip_context_files:
+             _soul_content = load_soul_md()
+@@ -4495,11 +4499,13 @@ class AIAgent:
+                 mem_block = self._memory_store.format_for_system_prompt("memory")
+                 if mem_block:
+                     prompt_parts.append(mem_block)
++                    _prompt_budget_memory_parts.append(mem_block)
+             # USER.md is always included when enabled.
+             if self._user_profile_enabled:
+                 user_block = self._memory_store.format_for_system_prompt("user")
+                 if user_block:
+                     prompt_parts.append(user_block)
++                    _prompt_budget_user_profile_parts.append(user_block)
+ 
+         # External memory provider system prompt block (additive to built-in)
+         if self._memory_manager:
+@@ -4507,6 +4513,7 @@ class AIAgent:
+                 _ext_mem_block = self._memory_manager.build_system_prompt()
+                 if _ext_mem_block:
+                     prompt_parts.append(_ext_mem_block)
++                    _prompt_budget_memory_parts.append(_ext_mem_block)
+             except Exception:
+                 pass
+ 
+@@ -4539,6 +4546,7 @@ class AIAgent:
+                 cwd=_context_cwd, skip_soul=_soul_loaded)
+             if context_files_prompt:
+                 prompt_parts.append(context_files_prompt)
++                _prompt_budget_context_file_parts.append(context_files_prompt)
+ 
+         from hermes_time import now as _hermes_now
+         now = _hermes_now()
+@@ -4573,7 +4581,14 @@ class AIAgent:
+         if platform_key in PLATFORM_HINTS:
+             prompt_parts.append(PLATFORM_HINTS[platform_key])
+ 
+-        return "\n\n".join(p.strip() for p in prompt_parts if p.strip())
++        final_prompt = "\n\n".join(p.strip() for p in prompt_parts if p.strip())
++        self._prompt_budget_system_components = {
++            "system_prompt": final_prompt,
++            "memory": "\n\n".join(p.strip() for p in _prompt_budget_memory_parts if p and p.strip()),
++            "user_profile": "\n\n".join(p.strip() for p in _prompt_budget_user_profile_parts if p and p.strip()),
++            "context_files": "\n\n".join(p.strip() for p in _prompt_budget_context_file_parts if p and p.strip()),
++        }
++        return final_prompt
+ 
+     # =========================================================================
+     # Pre/post-call guardrails (inspired by PR #1321 — @alireza78a)
+@@ -9543,6 +9558,7 @@ class AIAgent:
+                 # Continuing session — reuse the exact system prompt from
+                 # the previous turn so the Anthropic cache prefix matches.
+                 self._cached_system_prompt = stored_prompt
++                self._prompt_budget_system_components = {"system_prompt": stored_prompt}
+             else:
+                 # First turn of a new session — build from scratch.
+                 self._cached_system_prompt = self._build_system_prompt(system_message)
+@@ -9854,6 +9870,7 @@ class AIAgent:
+                 )
+ 
+             api_messages = []
++            current_api_user_idx = None
+             for idx, msg in enumerate(messages):
+                 api_msg = msg.copy()
+ 
+@@ -9863,6 +9880,7 @@ class AIAgent:
+                 # API-call-time only — the original message in `messages` is
+                 # never mutated, so nothing leaks into session persistence.
+                 if idx == current_turn_user_idx and msg.get("role") == "user":
++                    current_api_user_idx = len(api_messages)
+                     _injections = []
+                     if _ext_prefetch_cache:
+                         _fenced = build_memory_context_block(_ext_prefetch_cache)
+@@ -9911,6 +9929,8 @@ class AIAgent:
+             # cache prefix.  The system prompt is reserved for Hermes internals.
+             if effective_system:
+                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
++                if current_api_user_idx is not None:
++                    current_api_user_idx += 1
+ 
+             # Inject ephemeral prefill messages right after the system prompt
+             # but before conversation history. Same API-call-time-only pattern.
+@@ -9918,6 +9938,8 @@ class AIAgent:
+                 sys_offset = 1 if effective_system else 0
+                 for idx, pfm in enumerate(self.prefill_messages):
+                     api_messages.insert(sys_offset + idx, pfm.copy())
++                if current_api_user_idx is not None:
++                    current_api_user_idx += len(self.prefill_messages)
+ 
+             # Apply Anthropic prompt caching for Claude models on native
+             # Anthropic, OpenRouter, and third-party Anthropic-compatible
+@@ -9978,6 +10000,28 @@ class AIAgent:
+             # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
+             _sanitize_messages_surrogates(api_messages)
+ 
++            if self._session_db and self.session_id:
++                try:
++                    _budget_components = dict(getattr(self, "_prompt_budget_system_components", {}) or {})
++                    if effective_system:
++                        _budget_components["system_prompt"] = effective_system
++                    _budget_record = build_prompt_budget_record(
++                        trace_id=None,
++                        session_id=self.session_id,
++                        turn_id=effective_task_id,
++                        api_messages=api_messages,
++                        tools=self.tools or [],
++                        system_components=_budget_components,
++                        current_user_message_index=current_api_user_idx,
++                        memory_injection=build_memory_context_block(_ext_prefetch_cache) if _ext_prefetch_cache else "",
++                        plugin_user_context=_plugin_user_context,
++                        available_output_budget=self.max_tokens,
++                    )
++                    self._session_db.record_prompt_budget(_budget_record)
++                    emit_prompt_budget_warnings(_budget_record)
++                except Exception as e:
++                    logger.debug("Session DB record_prompt_budget failed: %s", e)
++
+             # Calculate approximate request size for logging
+             total_chars = sum(len(str(msg)) for msg in api_messages)
+             approx_tokens = estimate_messages_tokens_rough(api_messages)
+diff --git a/tests/agent/test_prompt_budget.py b/tests/agent/test_prompt_budget.py
+new file mode 100644
+index 000000000..df357c78e
+--- /dev/null
++++ b/tests/agent/test_prompt_budget.py
+@@ -0,0 +1,106 @@
++import builtins
++
++import pytest
++
++from agent import prompt_budget
++from agent.prompt_budget import build_prompt_budget_record, estimate_token_count
++
++
++@pytest.fixture(autouse=True)
++def clear_encoder_cache():
++    cache_clear = getattr(prompt_budget._get_token_encoder, "cache_clear", None)
++    if cache_clear:
++        cache_clear()
++    yield
++    cache_clear = getattr(prompt_budget._get_token_encoder, "cache_clear", None)
++    if cache_clear:
++        cache_clear()
++
++
++def test_estimate_token_count_caches_missing_tiktoken_import(monkeypatch):
++    original_import = builtins.__import__
++    attempted_tiktoken_imports = 0
++
++    def counting_import(name, *args, **kwargs):
++        nonlocal attempted_tiktoken_imports
++        if name == "tiktoken":
++            attempted_tiktoken_imports += 1
++            raise ModuleNotFoundError("No module named 'tiktoken'")
++        return original_import(name, *args, **kwargs)
++
++    prompt_budget._get_token_encoder.cache_clear()
++    monkeypatch.setattr(builtins, "__import__", counting_import)
++
++    assert [estimate_token_count("abcdefgh") for _ in range(5)] == [2, 2, 2, 2, 2]
++    assert attempted_tiktoken_imports == 1
++
++
++def test_estimate_token_count_fallback_still_matches_existing_behavior(monkeypatch):
++    monkeypatch.setattr(prompt_budget, "_get_token_encoder", lambda: None)
++
++    assert estimate_token_count(None) == 0
++    assert estimate_token_count("") == 0
++    assert estimate_token_count("abcd") == 1
++    assert estimate_token_count("abcde") == 2
++    assert estimate_token_count([1, 2]) == 2  # json text is "[1, 2]"
++
++
++def test_estimate_token_count_uses_cached_encoder_when_available(monkeypatch):
++    class FakeEncoder:
++        def __init__(self):
++            self.calls = []
++
++        def encode(self, text):
++            self.calls.append(text)
++            return text.split()
++
++    encoder = FakeEncoder()
++    monkeypatch.setattr(prompt_budget, "_get_token_encoder", lambda: encoder)
++
++    assert estimate_token_count("one two three") == 3
++    assert encoder.calls == ["one two three"]
++
++
++def test_build_prompt_budget_record_bucket_total_is_consistent(monkeypatch):
++    monkeypatch.setattr(prompt_budget, "_get_token_encoder", lambda: None)
++
++    record = build_prompt_budget_record(
++        trace_id="trace-1",
++        session_id="session-1",
++        turn_id="turn-1",
++        api_messages=[
++            {"role": "system", "content": "system text"},
++            {"role": "user", "content": "old question"},
++            {"role": "assistant", "content": "old answer"},
++            {"role": "tool", "content": "tool output"},
++            {"role": "user", "content": "current question"},
++        ],
++        tools=[{"type": "function", "function": {"name": "tool"}}],
++        system_components={
++            "system_prompt": "system text memory text profile text context text",
++            "memory": "memory text",
++            "user_profile": "profile text",
++            "context_files": "context text",
++        },
++        current_user_message_index=4,
++        memory_injection="retrieved memory",
++        available_output_budget=123,
++    )
++
++    bucket_names = [
++        "system_prompt_tokens",
++        "developer_prompt_tokens",
++        "tool_schema_tokens",
++        "memory_tokens",
++        "user_profile_tokens",
++        "conversation_history_tokens",
++        "context_file_tokens",
++        "tool_result_tokens",
++        "current_user_message_tokens",
++    ]
++
++    assert record["trace_id"] == "trace-1"
++    assert record["available_output_budget"] == 123
++    assert record["total_input_tokens"] == sum(int(record[name]) for name in bucket_names)
++    assert record["memory_tokens"] >= estimate_token_count("memory text")
++    assert record["tool_schema_tokens"] > 0
+diff --git a/tests/agent/test_prompt_budget_db.py b/tests/agent/test_prompt_budget_db.py
+new file mode 100644
+index 000000000..60b8ce125
+--- /dev/null
++++ b/tests/agent/test_prompt_budget_db.py
+@@ -0,0 +1,54 @@
++import sqlite3
++
++from hermes_state import SessionDB
++
++
++def _index_names(conn: sqlite3.Connection, table_name: str) -> set[str]:
++    rows = conn.execute(f"PRAGMA index_list({table_name})").fetchall()
++    return {row[1] for row in rows}
++
++
++def test_sessiondb_prompt_budgets_insert_and_indexes(tmp_path):
++    db = SessionDB(tmp_path / "state.db")
++    try:
++        budget_id = db.record_prompt_budget({
++            "trace_id": "trace-3",
++            "session_id": "session-3",
++            "turn_id": "turn-3",
++            "system_prompt_tokens": 10,
++            "developer_prompt_tokens": 2,
++            "tool_schema_tokens": 5,
++            "memory_tokens": 3,
++            "user_profile_tokens": 4,
++            "conversation_history_tokens": 6,
++            "context_file_tokens": 7,
++            "tool_result_tokens": 8,
++            "current_user_message_tokens": 9,
++            "total_input_tokens": 45,
++            "available_output_budget": 1000,
++        })
++
++        row = db._conn.execute(
++            "SELECT * FROM prompt_budgets WHERE budget_id = ?", (budget_id,)
++        ).fetchone()
++        assert row is not None
++        assert row["trace_id"] == "trace-3"
++        assert row["session_id"] == "session-3"
++        assert row["turn_id"] == "turn-3"
++        assert row["system_prompt_tokens"] == 10
++        assert row["developer_prompt_tokens"] == 2
++        assert row["tool_schema_tokens"] == 5
++        assert row["memory_tokens"] == 3
++        assert row["user_profile_tokens"] == 4
++        assert row["conversation_history_tokens"] == 6
++        assert row["context_file_tokens"] == 7
++        assert row["tool_result_tokens"] == 8
++        assert row["current_user_message_tokens"] == 9
++        assert row["total_input_tokens"] == 45
++        assert row["available_output_budget"] == 1000
++        assert _index_names(db._conn, "prompt_budgets") >= {
++            "idx_prompt_budgets_session_time",
++            "idx_prompt_budgets_trace",
++        }
++    finally:
++        db.close()
+-- 
+2.51.0
+

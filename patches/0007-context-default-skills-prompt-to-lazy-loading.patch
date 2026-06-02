@@ -1,0 +1,409 @@
+From d7cffad4a91cb1134172a2814bdcd987659dc481 Mon Sep 17 00:00:00 2001
+From: mojomast <mojomast@users.noreply.github.com>
+Date: Tue, 2 Jun 2026 18:16:17 -0400
+Subject: [PATCH 7/9] context: default skills prompt to lazy loading
+
+---
+ agent/prompt_builder.py            | 24 +++++---
+ hermes_cli/config.py               |  8 +--
+ run_agent.py                       | 91 ++++++++++++++++--------------
+ tests/agent/test_prompt_builder.py | 64 +++++++++++++++++----
+ tests/run_agent/test_run_agent.py  |  1 +
+ 5 files changed, 122 insertions(+), 66 deletions(-)
+
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 2b0a14ea6..3fa049032 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -621,9 +621,9 @@ def _skill_should_show(
+ def build_skills_system_prompt(
+     available_tools: "set[str] | None" = None,
+     available_toolsets: "set[str] | None" = None,
+-    index_mode: str = "full",
++    index_mode: str = "lazy",
+ ) -> str:
+-    """Build a compact skill index for the system prompt.
++    """Build lazy skill guidance or an optional skill index for the system prompt.
+ 
+     Two-layer cache:
+       1. In-process LRU dict keyed by (skills_dir, tools, toolsets)
+@@ -637,15 +637,25 @@ def build_skills_system_prompt(
+     are read-only — they appear in the index but new skills are always created
+     in the local dir.  Local skills take precedence when names collide.
+     """
+-    skills_dir = get_skills_dir()
+-    external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
+-    mode = (index_mode or "full").strip().lower()
+-    if mode not in {"full", "compact", "off"}:
+-        mode = "full"
++    mode = (index_mode or "lazy").strip().lower()
++    if mode not in {"full", "compact", "lazy", "off"}:
++        mode = "lazy"
+ 
+     if mode == "off":
+         return ""
+ 
++    if mode == "lazy":
++        return (
++            "## Skills (lazy-loaded)\n"
++            "Skills are available through tools, but the inventory is not injected to save context. "
++            "When a task may need specialized procedure, call skills_list (optionally with category) "
++            "to discover candidates, then skill_view(name) for the relevant skill before acting. "
++            "Use skill_manage to create or patch skills when you discover reusable workflows or outdated instructions. "
++            "Only skip skill retrieval when the task is trivial or no category is relevant."
++        )
++
++    skills_dir = get_skills_dir()
++    external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
+     if not skills_dir.exists() and not external_dirs:
+         return ""
+ 
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index 908bdc9b0..8ee72ad02 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -767,16 +767,16 @@ DEFAULT_CONFIG = {
+     "context": {
+         "engine": "compressor",
+         # Prompt assembly mode. "lean" is default for token throughput: cap
+-        # memory injection and use compact skills retrieval. Set to "full" for
++        # memory injection and use lazy skills retrieval. Set to "full" for
+         # legacy/autonomous runs that truly need every skill listed up front.
+         # Override per process with HERMES_CONTEXT_MODE.
+         "prompt_mode": "lean",
+         # Explicit prompt caps override mode defaults. Empty/None = mode default.
+         "memory_inject_char_limit": None,
+         "user_profile_inject_char_limit": None,
+-        # "full" injects the full skill inventory; "compact" injects only
+-        # retrieval instructions/category counts; "off" omits skill guidance.
+-        "skills_index_mode": "compact",
++        # "lazy" injects retrieval instructions only; "compact" adds category counts;
++        # "full" injects the full skill inventory; "off" omits skill guidance.
++        "skills_index_mode": "lazy",
+     },
+ 
+     # Persistent memory -- bounded curated memory injected into system prompt
+diff --git a/run_agent.py b/run_agent.py
+index 2feb0cb05..8b1276e88 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -1581,54 +1581,59 @@ class AIAgent:
+         self._memory_flush_min_turns = 6
+         self._turns_since_memory = 0
+         self._iters_since_skill = 0
+-        self._context_prompt_mode = "full"
+-        self._skills_index_mode = "full"
++        self._context_prompt_mode = "lean"
++        self._skills_index_mode = "lazy"
+         self._memory_inject_char_limit = None
+         self._user_inject_char_limit = None
++
++        def _optional_int(value, default=None):
++            if value in (None, ""):
++                return default
++            try:
++                parsed = int(value)
++            except (TypeError, ValueError):
++                return default
++            return parsed if parsed > 0 else default
++
++        try:
++            context_config = _agent_cfg.get("context", {}) or {}
++            context_mode = (
++                os.environ.get("HERMES_CONTEXT_MODE")
++                or context_config.get("prompt_mode")
++                or "lean"
++            )
++            context_mode = str(context_mode).strip().lower()
++            if context_mode not in {"full", "balanced", "lean"}:
++                context_mode = "lean"
++
++            mode_memory_caps = {
++                "full": (None, None),
++                "balanced": (6000, 6000),
++                "lean": (3000, 4000),
++            }
++            default_memory_cap, default_user_cap = mode_memory_caps[context_mode]
++            self._context_prompt_mode = context_mode
++            self._skills_index_mode = str(
++                os.environ.get("HERMES_SKILLS_INDEX_MODE")
++                or context_config.get("skills_index_mode")
++                or "lazy"
++            ).strip().lower()
++            self._memory_inject_char_limit = _optional_int(
++                os.environ.get("HERMES_MEMORY_INJECT_CHAR_LIMIT")
++                or context_config.get("memory_inject_char_limit"),
++                default_memory_cap,
++            )
++            self._user_inject_char_limit = _optional_int(
++                os.environ.get("HERMES_USER_PROFILE_INJECT_CHAR_LIMIT")
++                or context_config.get("user_profile_inject_char_limit"),
++                default_user_cap,
++            )
++        except Exception:
++            pass  # Context prompt controls are optional -- keep lean/lazy defaults
++
+         if not skip_memory:
+             try:
+                 mem_config = _agent_cfg.get("memory", {})
+-                context_config = _agent_cfg.get("context", {}) or {}
+-                context_mode = (
+-                    os.environ.get("HERMES_CONTEXT_MODE")
+-                    or context_config.get("prompt_mode")
+-                    or "full"
+-                )
+-                context_mode = str(context_mode).strip().lower()
+-                if context_mode not in {"full", "balanced", "lean"}:
+-                    context_mode = "full"
+-
+-                def _optional_int(value, default=None):
+-                    if value in (None, ""):
+-                        return default
+-                    try:
+-                        parsed = int(value)
+-                    except (TypeError, ValueError):
+-                        return default
+-                    return parsed if parsed > 0 else default
+-
+-                mode_memory_caps = {
+-                    "full": (None, None),
+-                    "balanced": (6000, 6000),
+-                    "lean": (3000, 4000),
+-                }
+-                default_memory_cap, default_user_cap = mode_memory_caps[context_mode]
+-                self._context_prompt_mode = context_mode
+-                self._skills_index_mode = str(
+-                    os.environ.get("HERMES_SKILLS_INDEX_MODE")
+-                    or context_config.get("skills_index_mode")
+-                    or ("compact" if context_mode in {"lean", "balanced"} else "full")
+-                ).strip().lower()
+-                self._memory_inject_char_limit = _optional_int(
+-                    os.environ.get("HERMES_MEMORY_INJECT_CHAR_LIMIT")
+-                    or context_config.get("memory_inject_char_limit"),
+-                    default_memory_cap,
+-                )
+-                self._user_inject_char_limit = _optional_int(
+-                    os.environ.get("HERMES_USER_PROFILE_INJECT_CHAR_LIMIT")
+-                    or context_config.get("user_profile_inject_char_limit"),
+-                    default_user_cap,
+-                )
+                 self._memory_enabled = mem_config.get("memory_enabled", False)
+                 self._user_profile_enabled = mem_config.get("user_profile_enabled", False)
+                 self._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
+diff --git a/tests/agent/test_prompt_builder.py b/tests/agent/test_prompt_builder.py
+index 16a8617e5..ce233813b 100644
+--- a/tests/agent/test_prompt_builder.py
++++ b/tests/agent/test_prompt_builder.py
+@@ -251,9 +251,42 @@ class TestBuildSkillsSystemPrompt:
+ 
+     def test_empty_when_no_skills_dir(self, monkeypatch, tmp_path):
+         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+-        result = build_skills_system_prompt()
++        result = build_skills_system_prompt(index_mode="full")
+         assert result == ""
+ 
++    def test_lazy_mode_returns_static_retrieval_prompt_without_inventory(self, monkeypatch, tmp_path):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        skills_dir = tmp_path / "skills" / "coding" / "python-debug"
++        skills_dir.mkdir(parents=True)
++        (skills_dir / "SKILL.md").write_text(
++            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
++        )
++
++        result = build_skills_system_prompt(index_mode="lazy")
++
++        assert "Skills (lazy-loaded)" in result
++        assert "skills_list" in result
++        assert "skill_view" in result
++        assert "skill_manage" in result
++        assert "python-debug" not in result
++        assert "Debug Python scripts" not in result
++        assert "Available skill categories" not in result
++        assert "available_skills" not in result
++
++    def test_invalid_index_mode_falls_back_to_lazy(self, monkeypatch, tmp_path):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        skills_dir = tmp_path / "skills" / "coding" / "python-debug"
++        skills_dir.mkdir(parents=True)
++        (skills_dir / "SKILL.md").write_text(
++            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
++        )
++
++        result = build_skills_system_prompt(index_mode="surprise")
++
++        assert "Skills (lazy-loaded)" in result
++        assert "python-debug" not in result
++        assert "available_skills" not in result
++
+     def test_builds_index_with_skills(self, monkeypatch, tmp_path):
+         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+         skills_dir = tmp_path / "skills" / "coding" / "python-debug"
+@@ -261,7 +294,7 @@ class TestBuildSkillsSystemPrompt:
+         (skills_dir / "SKILL.md").write_text(
+             "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+         )
+-        result = build_skills_system_prompt()
++        result = build_skills_system_prompt(index_mode="full")
+         assert "python-debug" in result
+         assert "Debug Python scripts" in result
+         assert "available_skills" in result
+@@ -290,7 +323,7 @@ class TestBuildSkillsSystemPrompt:
+             d = cat_dir / subdir
+             d.mkdir(parents=True, exist_ok=True)
+             (d / "SKILL.md").write_text("---\ndescription: Search stuff\n---\n")
+-        result = build_skills_system_prompt()
++        result = build_skills_system_prompt(index_mode="full")
+         # "search" should appear only once per category
+         assert result.count("- search") == 1
+ 
+@@ -318,7 +351,7 @@ class TestBuildSkillsSystemPrompt:
+ 
+         with patch("agent.skill_utils.sys") as mock_sys:
+             mock_sys.platform = "linux"
+-            result = build_skills_system_prompt()
++            result = build_skills_system_prompt(index_mode="full")
+ 
+         assert "web-search" in result
+         assert "imessage" not in result
+@@ -337,7 +370,7 @@ class TestBuildSkillsSystemPrompt:
+ 
+         with patch("agent.skill_utils.sys") as mock_sys:
+             mock_sys.platform = "darwin"
+-            result = build_skills_system_prompt()
++            result = build_skills_system_prompt(index_mode="full")
+ 
+         assert "imessage" in result
+         assert "Send iMessages" in result
+@@ -366,7 +399,7 @@ class TestBuildSkillsSystemPrompt:
+             "agent.prompt_builder.get_disabled_skill_names",
+             return_value={"old-tool"},
+         ):
+-            result = build_skills_system_prompt()
++            result = build_skills_system_prompt(index_mode="full")
+ 
+         assert "web-search" in result
+         assert "old-tool" not in result
+@@ -379,14 +412,14 @@ class TestBuildSkillsSystemPrompt:
+             "---\nname: cached-skill\ndescription: Cached skill\n---\n"
+         )
+ 
+-        first = build_skills_system_prompt()
++        first = build_skills_system_prompt(index_mode="full")
+         assert "cached-skill" in first
+ 
+         (tmp_path / "config.yaml").write_text(
+             "skills:\n  disabled: [cached-skill]\n"
+         )
+ 
+-        second = build_skills_system_prompt()
++        second = build_skills_system_prompt(index_mode="full")
+         assert "cached-skill" not in second
+ 
+     def test_includes_setup_needed_skills(self, monkeypatch, tmp_path):
+@@ -407,7 +440,7 @@ class TestBuildSkillsSystemPrompt:
+             "---\nname: free-skill\ndescription: No prereqs\n---\n"
+         )
+ 
+-        result = build_skills_system_prompt()
++        result = build_skills_system_prompt(index_mode="full")
+         assert "free-skill" in result
+         assert "gated-skill" in result
+ 
+@@ -424,7 +457,7 @@ class TestBuildSkillsSystemPrompt:
+             "prerequisites:\n  env_vars: [MY_API_KEY]\n---\n"
+         )
+ 
+-        result = build_skills_system_prompt()
++        result = build_skills_system_prompt(index_mode="full")
+         assert "ready-skill" in result
+ 
+     def test_non_local_backend_keeps_skill_visible_without_probe(
+@@ -442,7 +475,7 @@ class TestBuildSkillsSystemPrompt:
+             "prerequisites:\n  env_vars: [BACKEND_ONLY_KEY]\n---\n"
+         )
+ 
+-        result = build_skills_system_prompt()
++        result = build_skills_system_prompt(index_mode="full")
+         assert "backend-skill" in result
+ 
+ 
+@@ -938,6 +971,7 @@ class TestBuildSkillsSystemPromptConditional:
+             "---\nname: duckduckgo\ndescription: Free web search\nmetadata:\n  hermes:\n    fallback_for_toolsets: [web]\n---\n"
+         )
+         result = build_skills_system_prompt(
++            index_mode="full",
+             available_tools=set(),
+             available_toolsets={"web"},
+         )
+@@ -951,6 +985,7 @@ class TestBuildSkillsSystemPromptConditional:
+             "---\nname: duckduckgo\ndescription: Free web search\nmetadata:\n  hermes:\n    fallback_for_toolsets: [web]\n---\n"
+         )
+         result = build_skills_system_prompt(
++            index_mode="full",
+             available_tools=set(),
+             available_toolsets=set(),
+         )
+@@ -964,6 +999,7 @@ class TestBuildSkillsSystemPromptConditional:
+             "---\nname: openhue\ndescription: Hue lights\nmetadata:\n  hermes:\n    requires_toolsets: [terminal]\n---\n"
+         )
+         result = build_skills_system_prompt(
++            index_mode="full",
+             available_tools=set(),
+             available_toolsets=set(),
+         )
+@@ -977,6 +1013,7 @@ class TestBuildSkillsSystemPromptConditional:
+             "---\nname: openhue\ndescription: Hue lights\nmetadata:\n  hermes:\n    requires_toolsets: [terminal]\n---\n"
+         )
+         result = build_skills_system_prompt(
++            index_mode="full",
+             available_tools=set(),
+             available_toolsets={"terminal"},
+         )
+@@ -990,6 +1027,7 @@ class TestBuildSkillsSystemPromptConditional:
+             "---\nname: notes\ndescription: Take notes\n---\n"
+         )
+         result = build_skills_system_prompt(
++            index_mode="full",
+             available_tools=set(),
+             available_toolsets=set(),
+         )
+@@ -1003,7 +1041,7 @@ class TestBuildSkillsSystemPromptConditional:
+         (skill_dir / "SKILL.md").write_text(
+             "---\nname: duckduckgo\ndescription: Free web search\nmetadata:\n  hermes:\n    fallback_for_toolsets: [web]\n---\n"
+         )
+-        result = build_skills_system_prompt()
++        result = build_skills_system_prompt(index_mode="full")
+         assert "duckduckgo" in result
+ 
+     def test_null_metadata_does_not_crash(self, monkeypatch, tmp_path):
+@@ -1016,6 +1054,7 @@ class TestBuildSkillsSystemPromptConditional:
+             "---\nname: safe-skill\ndescription: Survives null metadata\nmetadata:\n---\n"
+         )
+         result = build_skills_system_prompt(
++            index_mode="full",
+             available_tools=set(),
+             available_toolsets=set(),
+         )
+@@ -1030,6 +1069,7 @@ class TestBuildSkillsSystemPromptConditional:
+             "---\nname: nested-null\ndescription: Null hermes key\nmetadata:\n  hermes:\n---\n"
+         )
+         result = build_skills_system_prompt(
++            index_mode="full",
+             available_tools=set(),
+             available_toolsets=set(),
+         )
+diff --git a/tests/run_agent/test_run_agent.py b/tests/run_agent/test_run_agent.py
+index 9c54daffe..0aeaf7b67 100644
+--- a/tests/run_agent/test_run_agent.py
++++ b/tests/run_agent/test_run_agent.py
+@@ -920,6 +920,7 @@ class TestBuildSystemPrompt:
+         assert "SKILLS_PROMPT" in prompt
+         assert mock_skills.call_args.kwargs["available_tools"] == set(toolset_map)
+         assert mock_skills.call_args.kwargs["available_toolsets"] == {"web", "skills"}
++        assert mock_skills.call_args.kwargs["index_mode"] == "lazy"
+ 
+ 
+ class TestToolUseEnforcementConfig:
+-- 
+2.51.0
+
